@@ -153,7 +153,7 @@ The Metrics Server provides resource usage data for pods and nodes, which KubeVi
 Navigate to the `kubeview` project directory and install the Go modules.
 
 ```bash
-cd /home/my-projects/aws/load-test/kubeview/
+cd /home/my-projects/awskubeview/
 go mod tidy
 ```
 
@@ -162,7 +162,7 @@ go mod tidy
 Build the KubeView executable:
 
 ```bash
-cd /home/my-projects/aws/load-test/kubeview/
+cd /home/my-projects/aws/kubeview/
 go build -o kubeview main.go
 ```
 This will create an executable named `kubeview` in your current directory.
