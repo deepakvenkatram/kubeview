@@ -561,37 +561,33 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topNodesMem = append(topNodesMem, nodesByMemory[i].Node)
 		}
 
-		podCPUChart := barchart.New(5, 10)
-		podCPUChart.SetTitle("Top Pods by CPU Usage")
-		var podCPUData []barchart.Bar
+		podCPUChart := barchart.New(10, 20)
+		var podCPUData []barchart.BarData
 		for _, p := range topPodsCPU {
-			podCPUData = append(podCPUData, barchart.Bar{Value: float64(totalPodCPU(podMetricsMap[p.Name]).MilliValue()), Label: p.Name})
+			podCPUData = append(podCPUData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodCPU(podMetricsMap[p.Name]).MilliValue())}}})
 		}
-		podCPUChart.SetData(podCPUData)
+		podCPUChart.PushAll(podCPUData)
 
-		podMemoryChart := barchart.New(5, 10)
-		podMemoryChart.SetTitle("Top Pods by Memory Usage")
-		var podMemoryData []barchart.Bar
+		podMemoryChart := barchart.New(10, 20)
+		var podMemoryData []barchart.BarData
 		for _, p := range topPodsMem {
-			podMemoryData = append(podMemoryData, barchart.Bar{Value: float64(totalPodMemory(podMetricsMap[p.Name]).Value() / (1024 * 1024)), Label: p.Name})
+			podMemoryData = append(podMemoryData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodMemory(podMetricsMap[p.Name]).Value() / (1024 * 1024))}}})
 		}
-		podMemoryChart.SetData(podMemoryData)
+		podMemoryChart.PushAll(podMemoryData)
 
-		nodeCPUChart := barchart.New(5, 10)
-		nodeCPUChart.SetTitle("Top Nodes by CPU Usage")
-		var nodeCPUData []barchart.Bar
+		nodeCPUChart := barchart.New(10, 20)
+		var nodeCPUData []barchart.BarData
 		for _, n := range topNodesCPU {
-			nodeCPUData = append(nodeCPUData, barchart.Bar{Value: float64(nodeMetricsMap[n.Name].Usage.Cpu().MilliValue()), Label: n.Name})
+			nodeCPUData = append(nodeCPUData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64(nodeMetricsMap[n.Name].Usage.Cpu().MilliValue())}}})
 		}
-		nodeCPUChart.SetData(nodeCPUData)
+		nodeCPUChart.PushAll(nodeCPUData)
 
-		nodeMemoryChart := barchart.New(5, 10)
-		nodeMemoryChart.SetTitle("Top Nodes by Memory Usage")
-		var nodeMemoryData []barchart.Bar
+		nodeMemoryChart := barchart.New(10, 20)
+		var nodeMemoryData []barchart.BarData
 		for _, n := range topNodesMem {
-			nodeMemoryData = append(nodeMemoryData, barchart.Bar{Value: float64(nodeMetricsMap[n.Name].Usage.Memory().Value() / (1024 * 1024)), Label: n.Name})
+			nodeMemoryData = append(nodeMemoryData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64(nodeMetricsMap[n.Name].Usage.Memory().Value() / (1024 * 1024))}}})
 		}
-		nodeMemoryChart.SetData(nodeMemoryData)
+		nodeMemoryChart.PushAll(nodeMemoryData)
 
 		return dashboardMsg{
 			clusterCPUUsage:    fmt.Sprintf("%s / %s (%s%%)", formatMilliCPU(&totalCPUUsage), formatMilliCPU(&totalCPUCapacity), formatPercentage(totalCPUUsage.MilliValue(), totalCPUCapacity.MilliValue())),
