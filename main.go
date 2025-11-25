@@ -423,7 +423,7 @@ func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind stri
 // getDashboardMetrics fetches and aggregates cluster-wide resource utilization metrics.
 func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) tea.Cmd {
 	return func() tea.Msg {
-		var totalCPUCapacity, totalMemoryCapacity, totalDiskCapacity resource.Quantity
+		var totalCPUCapacity, totalMemoryCapacity resource.Quantity
 		var totalCPUUsage, totalMemoryUsage resource.Quantity
 
 		// Get Nodes and Node Metrics
@@ -551,8 +551,6 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topPodsByMemory:    topPodsMem,
 			topNodesByCPU:      topNodesCPU,
 			topNodesByMemory:   topNodesMem,
-			podMetrics:         podMetricsMap,
-			nodeMetrics:        nodeMetricsMap,
 		}
 	}
 }
@@ -718,12 +716,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.topPodsByMemory = msg.topPodsByMemory
 		m.topNodesByCPU = msg.topNodesByCPU
 		m.topNodesByMemory = msg.topNodesByMemory
-		m.podCPUChart = msg.podCPUChart
-		m.podMemoryChart = msg.podMemoryChart
-		m.nodeCPUChart = msg.nodeCPUChart
-		m.nodeMemoryChart = msg.nodeMemoryChart
-		m.podMetrics = msg.podMetrics
-		m.nodeMetrics = msg.nodeMetrics
 		return m, doTick()
 	case tea.KeyMsg:
 		if m.view == viewConfirmDelete {
