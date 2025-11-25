@@ -746,22 +746,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		if m.view == viewEdit {
-			switch msg := msg.(type) {
-			case tea.KeyMsg:
-				switch msg.Type {
-				case tea.KeyCtrlS:
-					if m.previousView == viewDeployments {
-						d := m.deployments[m.cursor]
-						return m, patchDeployment(m.clientset, d.Namespace, d.Name, m.editor.Value())
-					}
-					if m.previousView == viewResourceQuotas {
-						rq := m.resourcequotas[m.cursor]
-						return m, patchResourceQuota(m.clientset, rq.Namespace, rq.Name, m.editor.Value())
-					}
-				case tea.KeyEsc:
-					m.view = viewDetails
-					m.editor.Reset()
+			switch msg.Type {
+			case tea.KeyCtrlS:
+				if m.previousView == viewDeployments {
+					d := m.deployments[m.cursor]
+					return m, patchDeployment(m.clientset, d.Namespace, d.Name, m.editor.Value())
 				}
+				if m.previousView == viewResourceQuotas {
+					rq := m.resourcequotas[m.cursor]
+					return m, patchResourceQuota(m.clientset, rq.Namespace, rq.Name, m.editor.Value())
+				}
+			case tea.KeyEsc:
+				m.view = viewDetails
+				m.editor.Reset()
+				return m, nil
 			}
 			var cmd tea.Cmd
 			m.editor, cmd = m.editor.Update(msg)
