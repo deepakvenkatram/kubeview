@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"net/smtp"
 	"strings"
 	"time"
 
+	"github.com/NimbleMarkets/ntcharts/barchart"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -55,7 +59,22 @@ const (
 	viewDashboard // New view state for Dashboard
 	viewResourceMenu
 	viewHelp
+	viewAlerts
+	viewResourceQuotas
+	viewEdit
+	viewWorkloads
+	viewStorage
+	viewNetworkMenu
+	viewCluster
+	viewSMTPConfig
 )
+
+type resourceQuotaLine struct {
+	Name      string
+	Resource  string
+	Used      string
+	Limit     string
+}
 
 type model struct {
 	view               viewState
@@ -72,8 +91,15 @@ type model struct {
 	services           []v1.Service
 	netpols            []networkingv1.NetworkPolicy
 	events             []v1.Event
+	alerts             []v1.Event
+	resourcequotas     []v1.ResourceQuota
+	resourceQuotaLines []resourceQuotaLine
 	namespaces         []v1.Namespace
 	resourceTypes      []string
+	workloadTypes      []string
+	storageTypes       []string
+	networkTypes       []string
+	clusterTypes       []string
 	selectedNamespace  string // "" == all
 	details            string
 	yamlContent        string    // New field for YAML content
@@ -83,6 +109,10 @@ type model struct {
 	topPodsByMemory    []v1.Pod  // Top pods by Memory usage
 	topNodesByCPU      []v1.Node // Top nodes by CPU usage
 	topNodesByMemory   []v1.Node // Top nodes by Memory usage
+	podCPUChart        barchart.Model
+	podMemoryChart     barchart.Model
+	nodeCPUChart       barchart.Model
+	nodeMemoryChart    barchart.Model
 	cursor             int
 	err                error
 	clientset          *kubernetes.Clientset
@@ -90,11 +120,21 @@ type model struct {
 	styles             Styles
 	viewport           viewport.Model
 	textInput          textinput.Model
+	editor             textarea.Model
+	smtpServer         textinput.Model
+	smtpPort           textinput.Model
+	smtpUsername       textinput.Model
+	smtpPassword       textinput.Model
+	recipientEmail     textinput.Model
+	statusMessage      string
+	statusMessageTimer *time.Timer
 	ready              bool
 }
 
 type tickMsg time.Time
 type logsMsg struct{ logs string }
+type emailSentMsg struct{}
+type clearStatusMsg struct{}
 type scaleMsg struct{}
 type podDeletedMsg struct{}
 type nodesMsg struct {
@@ -114,15 +154,32 @@ type servicesMsg struct{ services []v1.Service }
 type networkPoliciesMsg struct{ policies []networkingv1.NetworkPolicy }
 type eventsMsg struct{ events []v1.Event }
 type namespacesMsg struct{ namespaces []v1.Namespace }
+type alertsMsg struct{ alerts []v1.Event }
+type resourceQuotasMsg struct{ quotas []v1.ResourceQuota }
+type patchMsg struct{}
 type errMsg struct{ err error }
 type yamlMsg struct{ yaml string } // New message type
 type dashboardMsg struct {
-	clusterCPUUsage    string
-	clusterMemoryUsage string
-	topPodsByCPU       []v1.Pod
-	topPodsByMemory    []v1.Pod
-	topNodesByCPU      []v1.Node
-	topNodesByMemory   []v1.Node
+	clusterCPUUsage     string
+	clusterMemoryUsage  string
+	topPodsByCPU        []v1.Pod
+	topPodsByMemory     []v1.Pod
+	topNodesByCPU       []v1.Node
+	topNodesByMemory    []v1.Node
+	podCPUChartTitle    string
+	podMemoryChartTitle string
+	nodeCPUChartTitle   string
+	nodeMemoryChartTitle  string
+	podCPUChartData     []barchart.BarData
+	podMemoryChartData  []barchart.BarData
+	nodeCPUChartData    []barchart.BarData
+	nodeMemoryChartData []barchart.BarData
+}
+
+func (m *model) setView(view viewState) {
+	m.previousView = m.view
+	m.view = view
+	m.cursor = 0
 }
 
 func (e errMsg) Error() string { return e.err.Error() }
@@ -156,6 +213,42 @@ func scaleDeployment(clientset *kubernetes.Clientset, namespace, name string, re
 			return errMsg{err}
 		}
 		return scaleMsg{}
+	}
+}
+
+func patchDeployment(clientset *kubernetes.Clientset, namespace, name, patch string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := clientset.AppsV1().Deployments(namespace).Patch(context.Background(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return patchMsg{}
+	}
+}
+
+func patchResourceQuota(clientset *kubernetes.Clientset, namespace, name, patch string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := clientset.CoreV1().ResourceQuotas(namespace).Patch(context.Background(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return patchMsg{}
+	}
+}
+
+func sendEmail(server, port, username, password, recipient, subject, body string) tea.Cmd {
+	return func() tea.Msg {
+		auth := smtp.PlainAuth("", username, password, server)
+		to := []string{recipient}
+		msg := []byte("To: " + recipient + "\r\n" +
+			"Subject: " + subject + "\r\n" +
+			"\r\n" +
+			body + "\r\n")
+		err := smtp.SendMail(server+":"+port, auth, username, to, msg)
+		if err != nil {
+			return errMsg{err}
+		}
+		return emailSentMsg{}
 	}
 }
 
@@ -305,6 +398,34 @@ func getNamespaces(clientset *kubernetes.Clientset) tea.Cmd {
 	}
 }
 
+func getAlerts(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
+	return func() tea.Msg {
+		options := metav1.ListOptions{
+			FieldSelector: "type=Warning",
+		}
+		events, err := clientset.CoreV1().Events(namespace).List(context.Background(), options)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		alerts := events.Items
+		sort.Slice(alerts, func(i, j int) bool {
+			return alerts[i].LastTimestamp.Time.After(alerts[j].LastTimestamp.Time)
+		})
+		return alertsMsg{alerts}
+	}
+}
+
+func getResourceQuotas(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
+	return func() tea.Msg {
+		quotas, err := clientset.CoreV1().ResourceQuotas(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return resourceQuotasMsg{quotas.Items}
+	}
+}
+
 // getResourceYAML fetches a resource and returns its YAML representation.
 func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind string) tea.Cmd {
 	return func() tea.Msg {
@@ -354,7 +475,7 @@ func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind stri
 }
 
 // getDashboardMetrics fetches and aggregates cluster-wide resource utilization metrics.
-func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) tea.Cmd {
+func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset, styles Styles) tea.Cmd {
 	return func() tea.Msg {
 		var totalCPUCapacity, totalMemoryCapacity resource.Quantity
 		var totalCPUUsage, totalMemoryUsage resource.Quantity
@@ -477,6 +598,28 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topNodesMem = append(topNodesMem, nodesByMemory[i].Node)
 		}
 
+		var podCPUData []barchart.BarData
+		for _, p := range topPodsCPU {
+			podCPUData = append(podCPUData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodCPU(podMetricsMap[p.Name]).MilliValue()), Style: styles.Success}}})
+		}
+
+		var podMemoryData []barchart.BarData
+		for _, p := range topPodsMem {
+			podMemoryData = append(podMemoryData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodMemory(podMetricsMap[p.Name]).Value() / (1024 * 1024)), Style: styles.Success}}})
+		}
+
+		var nodeCPUData []barchart.BarData
+		for _, n := range topNodesCPU {
+			cpu := nodeMetricsMap[n.Name].Usage[v1.ResourceCPU]
+			nodeCPUData = append(nodeCPUData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64((&cpu).MilliValue()), Style: styles.Success}}})
+		}
+
+		var nodeMemoryData []barchart.BarData
+		for _, n := range topNodesMem {
+			mem := nodeMetricsMap[n.Name].Usage[v1.ResourceMemory]
+			nodeMemoryData = append(nodeMemoryData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64((&mem).Value() / (1024 * 1024)), Style: styles.Success}}})
+		}
+
 		return dashboardMsg{
 			clusterCPUUsage:    fmt.Sprintf("%s / %s (%s%%)", formatMilliCPU(&totalCPUUsage), formatMilliCPU(&totalCPUCapacity), formatPercentage(totalCPUUsage.MilliValue(), totalCPUCapacity.MilliValue())),
 			clusterMemoryUsage: fmt.Sprintf("%s / %s (%s%%)", formatMiBMemory(&totalMemoryUsage), formatMiBMemory(&totalMemoryCapacity), formatPercentage(totalMemoryUsage.Value(), totalMemoryCapacity.Value())),
@@ -484,6 +627,14 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topPodsByMemory:    topPodsMem,
 			topNodesByCPU:      topNodesCPU,
 			topNodesByMemory:   topNodesMem,
+			podCPUChartTitle:    "Top Pods by CPU (mCores)",
+			podMemoryChartTitle: "Top Pods by Memory (MiB)",
+			nodeCPUChartTitle:   "Top Nodes by CPU (mCores)",
+			nodeMemoryChartTitle:  "Top Nodes by Memory (MiB)",
+			podCPUChartData:    podCPUData,
+			podMemoryChartData: podMemoryData,
+			nodeCPUChartData:   nodeCPUData,
+			nodeMemoryChartData: nodeMemoryData,
 		}
 	}
 }
@@ -534,10 +685,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
 		case viewEvents:
 			return m, getEvents(m.clientset, m.selectedNamespace)
+		case viewAlerts:
+			return m, getAlerts(m.clientset, m.selectedNamespace)
+		case viewResourceQuotas:
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 		case viewDashboard:
-			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+			return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
 		}
 		return m, doTick()
+	case emailSentMsg:
+		if m.statusMessageTimer != nil {
+			m.statusMessageTimer.Stop()
+		}
+		m.statusMessage = "Email sent successfully!"
+		m.statusMessageTimer = time.NewTimer(3 * time.Second)
+		return m, func() tea.Msg {
+			<-m.statusMessageTimer.C
+			return clearStatusMsg{}
+		}
+	case clearStatusMsg:
+		m.statusMessage = ""
+		return m, nil
 	case logsMsg:
 		m.viewport.SetContent(msg.logs)
 		m.view = viewLogs
@@ -545,6 +713,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scaleMsg:
 		m.view = viewDetails
 		return m, getDeployments(m.clientset, m.selectedNamespace)
+	case patchMsg:
+		m.view = viewDetails
+		if m.previousView == viewDeployments {
+			return m, getDeployments(m.clientset, m.selectedNamespace)
+		}
+		if m.previousView == viewResourceQuotas {
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
+		}
+		return m, nil
 	case podDeletedMsg:
 		m.view = viewPods
 		return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
@@ -598,6 +775,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.events = msg.events
 		m.cursor = 0
 		return m, doTick()
+	case alertsMsg:
+		m.alerts = msg.alerts
+		m.cursor = 0
+		return m, doTick()
+	case resourceQuotasMsg:
+		m.resourcequotas = msg.quotas
+		var lines []resourceQuotaLine
+		for _, rq := range msg.quotas {
+			for resourceName, used := range rq.Status.Used {
+				limit, ok := rq.Spec.Hard[resourceName]
+				if !ok {
+					limit = resource.MustParse("0")
+				}
+				lines = append(lines, resourceQuotaLine{
+					Name:     rq.Name,
+					Resource: string(resourceName),
+					Used:     used.String(),
+					Limit:    limit.String(),
+				})
+			}
+		}
+		m.resourceQuotaLines = lines
+		m.cursor = 0
+		return m, doTick()
 	case errMsg:
 		m.err = msg
 		return m, nil // Don't quit, just store the error and let the View function display it
@@ -612,6 +813,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.topPodsByMemory = msg.topPodsByMemory
 		m.topNodesByCPU = msg.topNodesByCPU
 		m.topNodesByMemory = msg.topNodesByMemory
+		m.podCPUChart.SetTitle(msg.podCPUChartTitle)
+		m.podMemoryChart.SetTitle(msg.podMemoryChartTitle)
+		m.nodeCPUChart.SetTitle(msg.nodeCPUChartTitle)
+		m.nodeMemoryChart.SetTitle(msg.nodeMemoryChartTitle)
+		m.podCPUChart.PushAll(msg.podCPUChartData)
+		m.podMemoryChart.PushAll(msg.podMemoryChartData)
+		m.nodeCPUChart.PushAll(msg.nodeCPUChartData)
+		m.nodeMemoryChart.PushAll(msg.nodeMemoryChartData)
 		return m, doTick()
 	case tea.KeyMsg:
 		if m.view == viewConfirmDelete {
@@ -641,6 +850,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
+		if m.view == viewEdit {
+			switch msg.Type {
+			case tea.KeyCtrlS:
+				if m.previousView == viewDeployments {
+					d := m.deployments[m.cursor]
+					return m, patchDeployment(m.clientset, d.Namespace, d.Name, m.editor.Value())
+				}
+				if m.previousView == viewResourceQuotas {
+					rq := m.resourcequotas[m.cursor]
+					return m, patchResourceQuota(m.clientset, rq.Namespace, rq.Name, m.editor.Value())
+				}
+			case tea.KeyEsc:
+				m.view = viewDetails
+				m.editor.Reset()
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.editor, cmd = m.editor.Update(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
+		}
+		if m.view == viewSMTPConfig {
+			switch msg.String() {
+			case "enter":
+				subject := "KubeView Test Email"
+				body := "This is a test email from KubeView to confirm your SMTP settings are correct."
+				m.view = viewAlerts
+				return m, sendEmail(m.smtpServer.Value(), m.smtpPort.Value(), m.smtpUsername.Value(), m.smtpPassword.Value(), m.recipientEmail.Value(), subject, body)
+			case "esc":
+				m.view = viewAlerts
+			default:
+				var cmd tea.Cmd
+				if m.smtpServer.Focused() {
+					m.smtpServer, cmd = m.smtpServer.Update(msg)
+				} else if m.smtpPort.Focused() {
+					m.smtpPort, cmd = m.smtpPort.Update(msg)
+				} else if m.smtpUsername.Focused() {
+					m.smtpUsername, cmd = m.smtpUsername.Update(msg)
+				} else if m.smtpPassword.Focused() {
+					m.smtpPassword, cmd = m.smtpPassword.Update(msg)
+				} else if m.recipientEmail.Focused() {
+					m.recipientEmail, cmd = m.recipientEmail.Update(msg)
+				}
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
+		}
 		if m.view == viewLogs {
 			switch msg.String() {
 			case "esc", "backspace", "q":
@@ -661,6 +917,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
+		if m.view == viewAlerts {
+			switch msg.String() {
+			case "c":
+				m.previousView = viewAlerts
+				m.view = viewSMTPConfig
+				m.smtpServer.Focus()
+				return m, nil
+			}
+		}
+		if m.view == viewDetails && m.previousView == viewAlerts {
+			switch msg.String() {
+			case "s":
+				alert := m.alerts[m.cursor]
+				subject := fmt.Sprintf("KubeView Alert: %s", alert.Reason)
+				body := m.formatEventDetails(alert)
+				return m, sendEmail(m.smtpServer.Value(), m.smtpPort.Value(), m.smtpUsername.Value(), m.smtpPassword.Value(), m.recipientEmail.Value(), subject, body)
+			}
+		}
 		if m.view == viewDetails {
 			switch msg.String() {
 			case "d":
@@ -673,6 +947,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.view = viewScaling
 					m.textInput.Focus()
 					m.textInput.SetValue(fmt.Sprintf("%d", *m.deployments[m.cursor].Spec.Replicas))
+					return m, nil
+				}
+			case "e":
+				if m.previousView == viewDeployments {
+					m.view = viewEdit
+					d := m.deployments[m.cursor]
+					s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme, scheme.Scheme)
+					var b bytes.Buffer
+					if err := s.Encode(&d, &b); err == nil {
+						m.editor.SetValue(b.String())
+					}
+					m.editor.Focus()
+					return m, nil
+				}
+				if m.previousView == viewResourceQuotas {
+					m.view = viewEdit
+					rq := m.resourcequotas[m.cursor]
+					s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme, scheme.Scheme)
+					var b bytes.Buffer
+					if err := s.Encode(&rq, &b); err == nil {
+						m.editor.SetValue(b.String())
+					}
+					m.editor.Focus()
 					return m, nil
 				}
 			case "l":
@@ -771,9 +1068,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				selectedResource := m.resourceTypes[m.cursor]
 				switch selectedResource {
-				case "Nodes":
-					m.view = viewNodes
-					return m, getNodes(m.clientset, m.metricsClientset)
+				case "Workloads":
+					m.view = viewWorkloads
+					m.cursor = 0
+					return m, nil
+				case "Storage":
+					m.view = viewStorage
+					m.cursor = 0
+					return m, nil
+				case "Network":
+					m.view = viewNetworkMenu
+					m.cursor = 0
+					return m, nil
+				case "Cluster":
+					m.view = viewCluster
+					m.cursor = 0
+					return m, nil
+				}
+			case "esc", "backspace", "r":
+				m.view = m.previousView
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down":
+				if m.cursor < len(m.resourceTypes)-1 {
+					m.cursor++
+				}
+			}
+			return m, nil
+		}
+
+		if m.view == viewWorkloads {
+			switch msg.String() {
+			case "enter":
+				selectedResource := m.workloadTypes[m.cursor]
+				switch selectedResource {
 				case "Pods":
 					m.view = viewPods
 					return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
@@ -786,30 +1116,111 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "DaemonSets":
 					m.view = viewDaemonSets
 					return m, getDaemonSets(m.clientset, m.selectedNamespace)
-				case "Services":
-					m.view = viewServices
-					return m, getServices(m.clientset, m.selectedNamespace)
+				}
+			case "esc", "backspace":
+				m.view = viewResourceMenu
+				m.cursor = 0
+				return m, nil
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down":
+				if m.cursor < len(m.workloadTypes)-1 {
+					m.cursor++
+				}
+			}
+			return m, nil
+		}
+
+		if m.view == viewStorage {
+			switch msg.String() {
+			case "enter":
+				selectedResource := m.storageTypes[m.cursor]
+				switch selectedResource {
 				case "PVCs":
 					m.view = viewPVCs
 					return m, getPVCs(m.clientset, m.selectedNamespace)
 				case "PVs":
 					m.view = viewPVs
 					return m, getPVs(m.clientset)
-				case "Network Policies":
-					m.view = viewNetworkPolicies
-					return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
-				case "Events":
-					m.view = viewEvents
-					return m, getEvents(m.clientset, m.selectedNamespace)
 				}
-			case "esc", "backspace", "r":
-				m.view = m.previousView
+			case "esc", "backspace":
+				m.view = viewResourceMenu
+				m.cursor = 0
+				return m, nil
 			case "up":
 				if m.cursor > 0 {
 					m.cursor--
 				}
 			case "down":
-				if m.cursor < len(m.resourceTypes)-1 {
+				if m.cursor < len(m.storageTypes)-1 {
+					m.cursor++
+				}
+			}
+			return m, nil
+		}
+
+		if m.view == viewNetworkMenu {
+			switch msg.String() {
+			case "enter":
+				selectedResource := m.networkTypes[m.cursor]
+				switch selectedResource {
+				case "Services":
+					m.view = viewServices
+					return m, getServices(m.clientset, m.selectedNamespace)
+				case "Network Policies":
+					m.view = viewNetworkPolicies
+					return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
+				}
+			case "esc", "backspace":
+				m.view = viewResourceMenu
+				m.cursor = 0
+				return m, nil
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down":
+				if m.cursor < len(m.networkTypes)-1 {
+					m.cursor++
+				}
+			}
+			return m, nil
+		}
+
+		if m.view == viewCluster {
+			switch msg.String() {
+			case "enter":
+				selectedResource := m.clusterTypes[m.cursor]
+				switch selectedResource {
+				case "Nodes":
+					m.view = viewNodes
+					return m, getNodes(m.clientset, m.metricsClientset)
+				case "Namespaces":
+					m.previousView = viewCluster
+					m.view = viewNamespaces
+					return m, getNamespaces(m.clientset)
+				case "Events":
+					m.view = viewEvents
+					return m, getEvents(m.clientset, m.selectedNamespace)
+				case "Alerts":
+					m.view = viewAlerts
+					return m, getAlerts(m.clientset, m.selectedNamespace)
+				case "Resource Quotas":
+					m.view = viewResourceQuotas
+					return m, getResourceQuotas(m.clientset, m.selectedNamespace)
+				}
+			case "esc", "backspace":
+				m.view = viewResourceMenu
+				m.cursor = 0
+				return m, nil
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down":
+				if m.cursor < len(m.clusterTypes)-1 {
 					m.cursor++
 				}
 			}
@@ -835,7 +1246,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "D": // New keybinding for Dashboard
 			m.previousView = m.view
 			m.view = viewDashboard
-			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+			return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
+		case "A":
+			m.previousView = m.view
+			m.view = viewAlerts
+			return m, getAlerts(m.clientset, m.selectedNamespace)
+		case "Q":
+			m.previousView = m.view
+			m.view = viewResourceQuotas
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
@@ -863,6 +1282,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				listLen = len(m.netpols)
 			case viewEvents:
 				listLen = len(m.events)
+			case viewResourceQuotas:
+				listLen = len(m.resourceQuotaLines)
 			}
 			if m.cursor < listLen-1 {
 				m.cursor++
@@ -895,9 +1316,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.details = m.formatNetworkPolicyDetails(m.netpols[m.cursor])
 			case viewEvents:
 				m.details = m.formatEventDetails(m.events[m.cursor])
+			case viewAlerts:
+				m.details = m.formatEventDetails(m.alerts[m.cursor])
+			case viewResourceQuotas:
+				selectedLine := m.resourceQuotaLines[m.cursor]
+				for _, rq := range m.resourcequotas {
+					if rq.Name == selectedLine.Name {
+						m.details = m.formatResourceQuotaDetails(rq)
+						break
+					}
+				}
 			}
 			return m, nil
 		}
+	}
+
+	if m.view == viewDashboard {
+		var cmd tea.Cmd
+		m.podCPUChart, cmd = m.podCPUChart.Update(msg)
+		cmds = append(cmds, cmd)
+		m.podMemoryChart, cmd = m.podMemoryChart.Update(msg)
+		cmds = append(cmds, cmd)
+		m.nodeCPUChart, cmd = m.nodeCPUChart.Update(msg)
+		cmds = append(cmds, cmd)
+		m.nodeMemoryChart, cmd = m.nodeMemoryChart.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -930,14 +1373,37 @@ func (m model) headerView() string {
 		title = fmt.Sprintf("Network Policies in %s", nsText)
 	case viewEvents:
 		title = fmt.Sprintf("Events in %s", nsText)
+	case viewAlerts:
+		title = fmt.Sprintf("Alerts in %s", nsText)
+	case viewResourceQuotas:
+		title = fmt.Sprintf("Resource Quotas in %s", nsText)
 	case viewNamespaces:
 		title = "Select Namespace"
 	case viewResourceMenu:
-		title = "Select Resource"
+		title = "Select Resource Category"
+	case viewWorkloads:
+		title = "Select Workload"
+	case viewStorage:
+		title = "Select Storage Resource"
+	case viewNetworkMenu:
+		title = "Select Network Resource"
+	case viewCluster:
+		title = "Select Cluster Resource"
+	case viewSMTPConfig:
+		title = "Configure SMTP"
 	case viewHelp:
 		title = "Help"
 	case viewDetails:
 		title = "Details"
+	case viewEdit:
+		if m.previousView == viewDeployments {
+			d := m.deployments[m.cursor]
+			title = fmt.Sprintf("Editing Deployment: %s", d.Name)
+		}
+		if m.previousView == viewResourceQuotas {
+			rq := m.resourcequotas[m.cursor]
+			title = fmt.Sprintf("Editing Resource Quota: %s", rq.Name)
+		}
 	case viewLogs:
 		pod := m.pods[m.cursor]
 		title = fmt.Sprintf("Logs for %s", pod.Name)
@@ -960,15 +1426,19 @@ func (m model) footerView() string {
 		return m.styles.Muted.Render("(esc) back")
 	}
 
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
+	help := "(q)uit | (r)esources | (D)ash | (A)lerts | (N)s | (Q)uotas | (?) help"
 
 	if m.view == viewDetails {
 		baseHelp := "(esc) back"
 		switch m.previousView {
+		case viewAlerts:
+			baseHelp += " | (s)end email | (y)aml"
 		case viewPods:
 			baseHelp += " | (l)ogs | (d)elete | (y)aml"
 		case viewDeployments:
-			baseHelp += " | (r)eplicas | (y)aml"
+			baseHelp += " | (r)eplicas | (e)dit | (y)aml"
+		case viewResourceQuotas:
+			baseHelp += " | (e)dit | (y)aml"
 		default:
 			baseHelp += " | (y)aml"
 		}
@@ -983,13 +1453,22 @@ func (m model) footerView() string {
 	if m.view == viewScaling {
 		help = "(enter) confirm | (esc) cancel"
 	}
+	if m.view == viewEdit {
+		help = "(ctrl+s) save | (esc) cancel"
+	}
 	if m.view == viewConfirmDelete {
 		help = "(y)es / (n)o"
 	}
 	if m.view == viewResourceMenu {
 		help = "(enter) select | (esc) back"
 	}
-	return m.styles.Muted.Render(help)
+
+	status := ""
+	if m.statusMessage != "" {
+		status = m.styles.Success.Render(m.statusMessage)
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, status, m.styles.Muted.Render(help))
 }
 
 func (m model) View() string {
@@ -1008,6 +1487,11 @@ func (m model) View() string {
 	} else if m.view == viewYAML { // New case for YAML view
 		m.viewport.SetContent(m.yamlContent)
 		finalView = fmt.Sprintf("%s\n%s\n%s", m.headerView(), m.viewport.View(), m.footerView())
+	} else if m.view == viewEdit {
+		var b strings.Builder
+		b.WriteString(m.editor.View())
+		viewContent := b.String()
+		finalView = lipgloss.JoinVertical(lipgloss.Left, m.headerView(), viewContent, m.footerView())
 	} else if m.view == viewScaling {
 		var b strings.Builder
 		b.WriteString(m.details)
@@ -1046,10 +1530,24 @@ func (m model) View() string {
 			viewContent = m.renderNetworkPoliciesList()
 		case viewEvents:
 			viewContent = m.renderEventsList()
+		case viewAlerts:
+			viewContent = m.renderAlertsList()
+		case viewResourceQuotas:
+			viewContent = m.renderResourceQuotasList()
 		case viewNamespaces:
 			viewContent = m.renderNamespacesList()
 		case viewResourceMenu:
 			viewContent = m.renderResourceMenu()
+		case viewWorkloads:
+			viewContent = m.renderWorkloadsMenu()
+		case viewStorage:
+			viewContent = m.renderStorageMenu()
+		case viewNetworkMenu:
+			viewContent = m.renderNetworkMenu()
+		case viewCluster:
+			viewContent = m.renderClusterMenu()
+		case viewSMTPConfig:
+			viewContent = m.renderSMTPConfig()
 		case viewHelp:
 			viewContent = m.renderHelpView()
 		case viewDashboard: // New case
@@ -1082,9 +1580,138 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    y: View YAML\n\n")
 	b.WriteString("  Details View (Deployments):\n")
 	b.WriteString("    r: Scale replicas\n")
+	b.WriteString("    e: Edit deployment\n")
 	b.WriteString("    y: View YAML\n\n")
+	b.WriteString("  Details View (Resource Quotas):\n")
+	b.WriteString("    e: Edit resource quota\n")
+	b.WriteString("    y: View YAML\n\n")
+	b.WriteString("  Edit View:\n")
+	b.WriteString("    ctrl+s: Save changes\n")
+	b.WriteString("    esc: Cancel\n\n")
+	b.WriteString("  Alerts View:\n")
+	b.WriteString("    c: Configure SMTP\n")
+	b.WriteString("    s: Send email\n\n")
 	b.WriteString("  Other Details Views:\n")
 	b.WriteString("    y: View YAML\n")
+	return b.String()
+}
+
+func (m *model) renderWorkloadsMenu() string {
+	var b strings.Builder
+	b.WriteString(m.styles.HeaderText.Render("Select Workload") + "\n")
+
+	for i, resourceType := range m.workloadTypes {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+		b.WriteString(style.Render(resourceType) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderStorageMenu() string {
+	var b strings.Builder
+	b.WriteString(m.styles.HeaderText.Render("Select Storage Resource") + "\n")
+
+	for i, resourceType := range m.storageTypes {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+		b.WriteString(style.Render(resourceType) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderNetworkMenu() string {
+	var b strings.Builder
+	b.WriteString(m.styles.HeaderText.Render("Select Network Resource") + "\n")
+
+	for i, resourceType := range m.networkTypes {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+		b.WriteString(style.Render(resourceType) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderClusterMenu() string {
+	var b strings.Builder
+	b.WriteString(m.styles.HeaderText.Render("Select Cluster Resource") + "\n")
+
+	for i, resourceType := range m.clusterTypes {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+		b.WriteString(style.Render(resourceType) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) formatResourceQuotaDetails(rq v1.ResourceQuota) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", rq.Name))
+	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", rq.Namespace))
+	b.WriteString("\n" + m.styles.HeaderText.Render("Hard Limits") + "\n")
+	for resourceName, limit := range rq.Spec.Hard {
+		b.WriteString(fmt.Sprintf("  - %s:\t%s\n", resourceName, limit.String()))
+	}
+	b.WriteString("\n" + m.styles.HeaderText.Render("Used") + "\n")
+	for resourceName, used := range rq.Status.Used {
+		b.WriteString(fmt.Sprintf("  - %s:\t%s\n", resourceName, used.String()))
+	}
+	return b.String()
+}
+
+func (m *model) renderResourceQuotasList() string {
+	var b strings.Builder
+	if len(m.resourceQuotaLines) == 0 {
+		return "No Resource Quotas found."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-40s %-30s %-20s %-20s", "NAME", "RESOURCE", "USED", "LIMIT"))
+	b.WriteString(header + "\n")
+
+	for i, lineData := range m.resourceQuotaLines {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+
+		line := fmt.Sprintf("%-40s %-30s %-20s %-20s", lineData.Name, lineData.Resource, lineData.Used, lineData.Limit)
+		b.WriteString(style.Render(line) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderAlertsList() string {
+	var b strings.Builder
+	if len(m.alerts) == 0 {
+		return "No Alerts found."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-15s %-10s %-20s %-30s %s", "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"))
+	b.WriteString(header + "\n")
+
+	for i, a := range m.alerts {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+
+		ts := a.LastTimestamp.Time.Format("15:04:05")
+		obj := fmt.Sprintf("%s/%s", a.InvolvedObject.Kind, a.InvolvedObject.Name)
+		msg := strings.Split(a.Message, "\n")[0] // First line only
+
+		typeStyle := m.styles.Warning
+
+		line := fmt.Sprintf("%-15s %-10s %-20s %-30s %s", ts, typeStyle.Render(a.Type), a.Reason, obj, msg)
+		b.WriteString(style.Render(line) + "\n")
+	}
 	return b.String()
 }
 
@@ -1099,6 +1726,16 @@ func (m *model) renderResourceMenu() string {
 		}
 		b.WriteString(style.Render(resourceType) + "\n")
 	}
+	return b.String()
+}
+
+func (m *model) renderSMTPConfig() string {
+	var b strings.Builder
+	b.WriteString("SMTP Server: " + m.smtpServer.View() + "\n")
+	b.WriteString("SMTP Port: " + m.smtpPort.View() + "\n")
+	b.WriteString("Username: " + m.smtpUsername.View() + "\n")
+	b.WriteString("Password: " + m.smtpPassword.View() + "\n")
+	b.WriteString("Recipient Email: " + m.recipientEmail.View() + "\n")
 	return b.String()
 }
 
@@ -1389,41 +2026,17 @@ func (m *model) renderDashboard() string {
 	b.WriteString(fmt.Sprintf("  Memory: %s\n", m.clusterMemoryUsage))
 	b.WriteString("\n")
 
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Pods by CPU Usage") + "\n")
-	if len(m.topPodsByCPU) == 0 {
-		b.WriteString("  (none)\n")
+	if len(m.topPodsByCPU) == 0 && len(m.topPodsByMemory) == 0 && len(m.topNodesByCPU) == 0 && len(m.topNodesByMemory) == 0 {
+		b.WriteString("Metrics data not available. Ensure the metrics-server is installed and running.")
+	} else {
+		b.WriteString(m.podCPUChart.View())
+		b.WriteString("\n")
+		b.WriteString(m.podMemoryChart.View())
+		b.WriteString("\n")
+		b.WriteString(m.nodeCPUChart.View())
+		b.WriteString("\n")
+		b.WriteString(m.nodeMemoryChart.View())
 	}
-	for _, p := range m.topPodsByCPU {
-		b.WriteString(fmt.Sprintf("  - %s/%s\n", p.Namespace, p.Name))
-	}
-	b.WriteString("\n")
-
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Pods by Memory Usage") + "\n")
-	if len(m.topPodsByMemory) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, p := range m.topPodsByMemory {
-		b.WriteString(fmt.Sprintf("  - %s/%s\n", p.Namespace, p.Name))
-	}
-	b.WriteString("\n")
-
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Nodes by CPU Usage") + "\n")
-	if len(m.topNodesByCPU) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, n := range m.topNodesByCPU {
-		b.WriteString(fmt.Sprintf("  - %s\n", n.Name))
-	}
-	b.WriteString("\n")
-
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Nodes by Memory Usage") + "\n")
-	if len(m.topNodesByMemory) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, n := range m.topNodesByMemory {
-		b.WriteString(fmt.Sprintf("  - %s\n", n.Name))
-	}
-	b.WriteString("\n")
 
 	return b.String()
 }
@@ -1734,7 +2347,7 @@ func getContainerStatus(pod v1.Pod, containerName string) bool {
 func totalPodCPU(metrics v1beta1.PodMetrics) *resource.Quantity {
 	total := resource.NewQuantity(0, resource.DecimalSI)
 	for _, c := range metrics.Containers {
-		total.Add(*c.Usage.Cpu())
+		total.Add(c.Usage[v1.ResourceCPU])
 	}
 	return total
 }
@@ -1742,7 +2355,7 @@ func totalPodCPU(metrics v1beta1.PodMetrics) *resource.Quantity {
 func totalPodMemory(metrics v1beta1.PodMetrics) *resource.Quantity {
 	total := resource.NewQuantity(0, resource.BinarySI)
 	for _, c := range metrics.Containers {
-		total.Add(*c.Usage.Memory())
+		total.Add(c.Usage[v1.ResourceMemory])
 	}
 	return total
 }
@@ -1853,12 +2466,41 @@ func main() {
 	ti.CharLimit = 3
 	ti.Width = 5
 
+	editor := textarea.New()
+	editor.Placeholder = "Enter patch here"
+	editor.SetWidth(80)
+	editor.SetHeight(10)
+
+	podCPUChart := barchart.New(10, 20)
+	podMemoryChart := barchart.New(10, 20)
+	nodeCPUChart := barchart.New(10, 20)
+	nodeMemoryChart := barchart.New(10, 20)
+
+	smtpPassword := textinput.New()
+	smtpPassword.Placeholder = "Password"
+	smtpPassword.EchoMode = textinput.EchoPassword
+	smtpPassword.CharLimit = 64
+
 	initialModel := model{
 		clientset:        clientset,
 		metricsClientset: metricsClientset,
 		styles:           defaultStyles(),
 		textInput:        ti,
-		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events"},
+		editor:           editor,
+		podCPUChart:      podCPUChart,
+		podMemoryChart:   podMemoryChart,
+		nodeCPUChart:     nodeCPUChart,
+		nodeMemoryChart:  nodeMemoryChart,
+		resourceTypes:    []string{"Workloads", "Storage", "Network", "Cluster"},
+		workloadTypes:    []string{"Pods", "Deployments", "StatefulSets", "DaemonSets"},
+		storageTypes:     []string{"PVCs", "PVs"},
+		networkTypes:     []string{"Services", "Network Policies"},
+		clusterTypes:     []string{"Nodes", "Namespaces", "Events", "Alerts", "Resource Quotas"},
+		smtpServer:       textinput.New(),
+		smtpPort:         textinput.New(),
+		smtpUsername:     textinput.New(),
+		smtpPassword:     smtpPassword,
+		recipientEmail:   textinput.New(),
 	}
 
 	p := tea.NewProgram(initialModel, tea.WithAltScreen())
