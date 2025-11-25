@@ -55,7 +55,16 @@ const (
 	viewDashboard // New view state for Dashboard
 	viewResourceMenu
 	viewHelp
+	viewAlerts
+	viewResourceQuotas
 )
+
+type resourceQuotaLine struct {
+	Name      string
+	Resource  string
+	Used      string
+	Limit     string
+}
 
 type model struct {
 	view               viewState
@@ -72,6 +81,9 @@ type model struct {
 	services           []v1.Service
 	netpols            []networkingv1.NetworkPolicy
 	events             []v1.Event
+	alerts             []v1.Event
+	resourcequotas     []v1.ResourceQuota
+	resourceQuotaLines []resourceQuotaLine
 	namespaces         []v1.Namespace
 	resourceTypes      []string
 	selectedNamespace  string // "" == all
@@ -114,6 +126,8 @@ type servicesMsg struct{ services []v1.Service }
 type networkPoliciesMsg struct{ policies []networkingv1.NetworkPolicy }
 type eventsMsg struct{ events []v1.Event }
 type namespacesMsg struct{ namespaces []v1.Namespace }
+type alertsMsg struct{ alerts []v1.Event }
+type resourceQuotasMsg struct{ quotas []v1.ResourceQuota }
 type errMsg struct{ err error }
 type yamlMsg struct{ yaml string } // New message type
 type dashboardMsg struct {
@@ -302,6 +316,34 @@ func getNamespaces(clientset *kubernetes.Clientset) tea.Cmd {
 			return errMsg{err}
 		}
 		return namespacesMsg{ns.Items}
+	}
+}
+
+func getAlerts(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
+	return func() tea.Msg {
+		options := metav1.ListOptions{
+			FieldSelector: "type=Warning",
+		}
+		events, err := clientset.CoreV1().Events(namespace).List(context.Background(), options)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		alerts := events.Items
+		sort.Slice(alerts, func(i, j int) bool {
+			return alerts[i].LastTimestamp.Time.After(alerts[j].LastTimestamp.Time)
+		})
+		return alertsMsg{alerts}
+	}
+}
+
+func getResourceQuotas(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
+	return func() tea.Msg {
+		quotas, err := clientset.CoreV1().ResourceQuotas(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return resourceQuotasMsg{quotas.Items}
 	}
 }
 
@@ -534,6 +576,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
 		case viewEvents:
 			return m, getEvents(m.clientset, m.selectedNamespace)
+		case viewAlerts:
+			return m, getAlerts(m.clientset, m.selectedNamespace)
+		case viewResourceQuotas:
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 		case viewDashboard:
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
 		}
@@ -596,6 +642,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, doTick()
 	case eventsMsg:
 		m.events = msg.events
+		m.cursor = 0
+		return m, doTick()
+	case alertsMsg:
+		m.alerts = msg.alerts
+		m.cursor = 0
+		return m, doTick()
+	case resourceQuotasMsg:
+		m.resourcequotas = msg.quotas
+		var lines []resourceQuotaLine
+		for _, rq := range msg.quotas {
+			for resourceName, used := range rq.Status.Used {
+				limit, ok := rq.Spec.Hard[resourceName]
+				if !ok {
+					limit = resource.MustParse("0")
+				}
+				lines = append(lines, resourceQuotaLine{
+					Name:     rq.Name,
+					Resource: string(resourceName),
+					Used:     used.String(),
+					Limit:    limit.String(),
+				})
+			}
+		}
+		m.resourceQuotaLines = lines
 		m.cursor = 0
 		return m, doTick()
 	case errMsg:
@@ -801,6 +871,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "Events":
 					m.view = viewEvents
 					return m, getEvents(m.clientset, m.selectedNamespace)
+				case "Alerts":
+					m.view = viewAlerts
+					return m, getAlerts(m.clientset, m.selectedNamespace)
+				case "Resource Quotas":
+					m.view = viewResourceQuotas
+					return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 				}
 			case "esc", "backspace", "r":
 				m.view = m.previousView
@@ -836,6 +912,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previousView = m.view
 			m.view = viewDashboard
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+		case "A":
+			m.previousView = m.view
+			m.view = viewAlerts
+			return m, getAlerts(m.clientset, m.selectedNamespace)
+		case "Q":
+			m.previousView = m.view
+			m.view = viewResourceQuotas
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
@@ -863,6 +947,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				listLen = len(m.netpols)
 			case viewEvents:
 				listLen = len(m.events)
+			case viewResourceQuotas:
+				listLen = len(m.resourceQuotaLines)
 			}
 			if m.cursor < listLen-1 {
 				m.cursor++
@@ -930,6 +1016,10 @@ func (m model) headerView() string {
 		title = fmt.Sprintf("Network Policies in %s", nsText)
 	case viewEvents:
 		title = fmt.Sprintf("Events in %s", nsText)
+	case viewAlerts:
+		title = fmt.Sprintf("Alerts in %s", nsText)
+	case viewResourceQuotas:
+		title = fmt.Sprintf("Resource Quotas in %s", nsText)
 	case viewNamespaces:
 		title = "Select Namespace"
 	case viewResourceMenu:
@@ -960,7 +1050,7 @@ func (m model) footerView() string {
 		return m.styles.Muted.Render("(esc) back")
 	}
 
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
+	help := "(q)uit | (r)esources | (D)ash | (A)lerts | (N)s | (Q)uotas | (?) help"
 
 	if m.view == viewDetails {
 		baseHelp := "(esc) back"
@@ -1046,6 +1136,10 @@ func (m model) View() string {
 			viewContent = m.renderNetworkPoliciesList()
 		case viewEvents:
 			viewContent = m.renderEventsList()
+		case viewAlerts:
+			viewContent = m.renderAlertsList()
+		case viewResourceQuotas:
+			viewContent = m.renderResourceQuotasList()
 		case viewNamespaces:
 			viewContent = m.renderNamespacesList()
 		case viewResourceMenu:
@@ -1071,6 +1165,8 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    ?: Show this help view\n")
 	b.WriteString("    r: Open resource selection menu\n")
 	b.WriteString("    D: Show cluster dashboard\n")
+	b.WriteString("    A: Show alerts\n")
+	b.WriteString("    Q: Show resource quotas\n")
 	b.WriteString("    N: Select namespace\n\n")
 	b.WriteString("  Navigation:\n")
 	b.WriteString("    up/down: Move cursor\n")
@@ -1085,6 +1181,54 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    y: View YAML\n\n")
 	b.WriteString("  Other Details Views:\n")
 	b.WriteString("    y: View YAML\n")
+	return b.String()
+}
+
+func (m *model) renderResourceQuotasList() string {
+	var b strings.Builder
+	if len(m.resourceQuotaLines) == 0 {
+		return "No Resource Quotas found."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"30s %-"+"20s %-"+"20s", "NAME", "RESOURCE", "USED", "LIMIT"))
+	b.WriteString(header + "\n")
+
+	for i, lineData := range m.resourceQuotaLines {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+
+		line := fmt.Sprintf("%-"+"40s %-"+"30s %-"+"20s %-"+"20s", lineData.Name, lineData.Resource, lineData.Used, lineData.Limit)
+		b.WriteString(style.Render(line) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderAlertsList() string {
+	var b strings.Builder
+	if len(m.alerts) == 0 {
+		return "No Alerts found."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"))
+	b.WriteString(header + "\n")
+
+	for i, a := range m.alerts {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+
+		ts := a.LastTimestamp.Time.Format("15:04:05")
+		obj := fmt.Sprintf("%s/%s", a.InvolvedObject.Kind, a.InvolvedObject.Name)
+		msg := strings.Split(a.Message, "\n")[0] // First line only
+
+		typeStyle := m.styles.Warning
+
+		line := fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", ts, typeStyle.Render(a.Type), a.Reason, obj, msg)
+		b.WriteString(style.Render(line) + "\n")
+	}
 	return b.String()
 }
 
@@ -1858,7 +2002,7 @@ func main() {
 		metricsClientset: metricsClientset,
 		styles:           defaultStyles(),
 		textInput:        ti,
-		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events"},
+		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events", "Alerts", "Resource Quotas"},
 	}
 
 	p := tea.NewProgram(initialModel, tea.WithAltScreen())
