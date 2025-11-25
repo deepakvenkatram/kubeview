@@ -6,21 +6,22 @@ KubeView is a command-line interface (CLI) tool written in Go that provides a re
 
 1.  [Project Overview](#project-overview)
 2.  [Features](#features)
-3.  [Prerequisites](#prerequisites)
+3.  [Screenshots](#screenshots)
+4.  [Prerequisites](#prerequisites)
     *   [Go Programming Language](#go-programming-language)
     *   [K3s Kubernetes Distribution](#k3s-kubernetes-distribution)
     *   [Kubernetes Metrics Server](#kubernetes-metrics-server)
-4.  [Installation Guide](#installation-guide)
+5.  [Installation Guide](#installation-guide)
     *   [Install Go](#install-go)
     *   [Install K3s](#install-k3s)
     *   [Install Kubernetes Metrics Server](#install-kubernetes-metrics-server)
     *   [Install KubeView Dependencies](#install-kubeview-dependencies)
     *   [Build KubeView](#build-kubeview)
-5.  [Running KubeView](#running-kubeview)
-6.  [Usage](#usage)
-7.  [Project Structure](#project-structure)
-8.  [Contributing](#contributing)
-9.  [License](#license)
+6.  [Running KubeView](#running-kubeview)
+7.  [Usage](#usage)
+8.  [Project Structure](#project-structure)
+9.  [Contributing](#contributing)
+10. [License](#license)
 
 ## Project Overview
 
@@ -28,10 +29,68 @@ KubeView aims to simplify the monitoring and understanding of Kubernetes cluster
 
 ## Features
 
-*   Interactive terminal UI for Kubernetes resource visualization.
-*   Real-time updates of cluster status.
-*   Easy navigation through different Kubernetes resources.
-*   Lightweight and efficient, built with Go.
+*   **Interactive Terminal UI:** Visualize your Kubernetes resources in a user-friendly, terminal-based interface.
+*   **Real-time Updates:** Get real-time updates of your cluster's status.
+*   **Easy Navigation:** Navigate through different Kubernetes resources with simple keybindings.
+*   **Graphical Dashboard:** View a graphical dashboard with charts for resource utilization.
+*   **Alerting System:** Monitor for potential issues with the built-in alerting system.
+*   **Resource Quota Monitoring:** Keep track of your resource quotas and usage.
+*   **Deployment Patching:** Patch your deployments directly from the TUI.
+*   **Resource Quota Editing:** Edit your resource quotas on the fly.
+*   **Lightweight and Efficient:** Built with Go for optimal performance.
+
+## Screenshots
+
+### Dashboard View
+
+```
+ Cluster Dashboard
+ ────────────────────────────────────────────────────────────────────────────────────────────────
+ Cluster-wide Resource Usage
+   CPU: 100m / 1000m (10%)
+   Memory: 500Mi / 2048Mi (24%)
+   Disk: 0Gi / 100Gi (0%)
+
+ Top Pods by CPU Usage
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                       Top Pods by CPU Usage                                  │
+ │                                                                                              │
+ │   nginx-deployment-5f5d8f6c8c-l5z8z  बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा  100m│
+ │   coredns-5f5d8f6c8c-l5z8z          बारा बारा बारा बारा बारा बारा बारा                         50m│
+ │   metrics-server-5f5d8f6c8c-l5z8z   बारा बारा बारा बारा                                        20m│
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Top Pods by Memory Usage
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                     Top Pods by Memory Usage                                 │
+ │                                                                                              │
+ │   nginx-deployment-5f5d8f6c8c-l5z8z बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा 200Mi│
+ │   coredns-5f5d8f6c8c-l5z8z          बारा बारा बारा बारा बारा                                 100Mi│
+ │   metrics-server-5f5d8f6c8c-l5z8z   बारा बारा                                                 50Mi│
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Alerts View
+
+```
+ Alerts in all namespaces
+ ────────────────────────────────────────────────────────────────────────────────────────────────
+ LAST SEEN   TYPE      REASON              OBJECT                         MESSAGE
+ 15:04:05    Warning   FailedScheduling    pod/nginx-deployment-...       0/1 nodes are available: 1 node(s) had taint {node-role.kubernetes.io/master: }, that the pod didn't tolerate.
+ 15:03:05    Warning   FailedScheduling    pod/nginx-deployment-...       0/1 nodes are available: 1 node(s) had taint {node-role.kubernetes.io/master: }, that the pod didn't tolerate.
+```
+
+### Resource Quotas View
+
+```
+ Resource Quotas in all namespaces
+ ────────────────────────────────────────────────────────────────────────────────────────────────
+ NAME                RESOURCE                      USED                LIMIT
+ gke-resource-quotas   requests.cpu                  100m                2
+ gke-resource-quotas   requests.memory               500Mi               4Gi
+ gke-resource-quotas   limits.cpu                    200m                4
+ gke-resource-quotas   limits.memory                 1Gi                 8Gi
+```
 
 ## Prerequisites
 
@@ -153,7 +212,7 @@ The Metrics Server provides resource usage data for pods and nodes, which KubeVi
 Navigate to the `kubeview` project directory and install the Go modules.
 
 ```bash
-cd /home/my-projects/awskubeview/
+cd /path/to/kubeview
 go mod tidy
 ```
 
@@ -162,8 +221,8 @@ go mod tidy
 Build the KubeView executable:
 
 ```bash
-cd /home/my-projects/aws/kubeview/
-go build -o kubeview main.go
+cd /path/to/kubeview
+go build -o kubeview .
 ```
 This will create an executable named `kubeview` in your current directory.
 
@@ -178,7 +237,35 @@ Replace `/etc/rancher/k3s/k3s.yaml` with the actual path to your Kubeconfig file
 
 ## Usage
 
-(This section will be expanded as KubeView features are developed. For now, it will launch the TUI.)
+KubeView is an interactive TUI. Use the following keybindings to navigate the application:
+
+*   **q, ctrl+c:** Quit
+*   **?:** Show this help view
+*   **r:** Open resource selection menu
+*   **D:** Show cluster dashboard
+*   **A:** Show alerts
+*   **Q:** Show resource quotas
+*   **N:** Select namespace
+*   **up/down:** Move cursor
+*   **enter:** Select / View details
+*   **esc:** Go back
+
+### Details View (Pods)
+
+*   **l:** View logs
+*   **d:** Delete pod
+*   **y:** View YAML
+
+### Details View (Deployments)
+
+*   **r:** Scale replicas
+*   **e:** Edit deployment
+*   **y:** View YAML
+
+### Details View (Resource Quotas)
+
+*   **e:** Edit resource quota
+*   **y:** View YAML
 
 ## Project Structure
 
