@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -57,6 +59,7 @@ const (
 	viewHelp
 	viewAlerts
 	viewResourceQuotas
+	viewEdit
 )
 
 type resourceQuotaLine struct {
@@ -102,6 +105,7 @@ type model struct {
 	styles             Styles
 	viewport           viewport.Model
 	textInput          textinput.Model
+	editor             textarea.Model
 	ready              bool
 }
 
@@ -128,15 +132,16 @@ type eventsMsg struct{ events []v1.Event }
 type namespacesMsg struct{ namespaces []v1.Namespace }
 type alertsMsg struct{ alerts []v1.Event }
 type resourceQuotasMsg struct{ quotas []v1.ResourceQuota }
+type patchMsg struct{}
 type errMsg struct{ err error }
 type yamlMsg struct{ yaml string } // New message type
 type dashboardMsg struct {
-	clusterCPUUsage    string
-	clusterMemoryUsage string
-	topPodsByCPU       []v1.Pod
-	topPodsByMemory    []v1.Pod
-	topNodesByCPU      []v1.Node
-	topNodesByMemory   []v1.Node
+	clusterCPUUsage     string
+	clusterMemoryUsage  string
+	topPodsByCPU        []v1.Pod
+	topPodsByMemory     []v1.Pod
+	topNodesByCPU       []v1.Node
+	topNodesByMemory    []v1.Node
 }
 
 func (e errMsg) Error() string { return e.err.Error() }
@@ -170,6 +175,26 @@ func scaleDeployment(clientset *kubernetes.Clientset, namespace, name string, re
 			return errMsg{err}
 		}
 		return scaleMsg{}
+	}
+}
+
+func patchDeployment(clientset *kubernetes.Clientset, namespace, name, patch string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := clientset.AppsV1().Deployments(namespace).Patch(context.Background(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return patchMsg{}
+	}
+}
+
+func patchResourceQuota(clientset *kubernetes.Clientset, namespace, name, patch string) tea.Cmd {
+	return func() tea.Msg {
+		_, err := clientset.CoreV1().ResourceQuotas(namespace).Patch(context.Background(), name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return patchMsg{}
 	}
 }
 
@@ -398,7 +423,7 @@ func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind stri
 // getDashboardMetrics fetches and aggregates cluster-wide resource utilization metrics.
 func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) tea.Cmd {
 	return func() tea.Msg {
-		var totalCPUCapacity, totalMemoryCapacity resource.Quantity
+		var totalCPUCapacity, totalMemoryCapacity, totalDiskCapacity resource.Quantity
 		var totalCPUUsage, totalMemoryUsage resource.Quantity
 
 		// Get Nodes and Node Metrics
@@ -526,6 +551,8 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topPodsByMemory:    topPodsMem,
 			topNodesByCPU:      topNodesCPU,
 			topNodesByMemory:   topNodesMem,
+			podMetrics:         podMetricsMap,
+			nodeMetrics:        nodeMetricsMap,
 		}
 	}
 }
@@ -591,6 +618,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case scaleMsg:
 		m.view = viewDetails
 		return m, getDeployments(m.clientset, m.selectedNamespace)
+	case patchMsg:
+		m.view = viewDetails
+		if m.previousView == viewDeployments {
+			return m, getDeployments(m.clientset, m.selectedNamespace)
+		}
+		if m.previousView == viewResourceQuotas {
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
+		}
+		return m, nil
 	case podDeletedMsg:
 		m.view = viewPods
 		return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
@@ -682,6 +718,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.topPodsByMemory = msg.topPodsByMemory
 		m.topNodesByCPU = msg.topNodesByCPU
 		m.topNodesByMemory = msg.topNodesByMemory
+		m.podCPUChart = msg.podCPUChart
+		m.podMemoryChart = msg.podMemoryChart
+		m.nodeCPUChart = msg.nodeCPUChart
+		m.nodeMemoryChart = msg.nodeMemoryChart
+		m.podMetrics = msg.podMetrics
+		m.nodeMetrics = msg.nodeMetrics
 		return m, doTick()
 	case tea.KeyMsg:
 		if m.view == viewConfirmDelete {
@@ -709,6 +751,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput, cmd = m.textInput.Update(msg)
 				cmds = append(cmds, cmd)
 			}
+			return m, tea.Batch(cmds...)
+		}
+		if m.view == viewEdit {
+			switch msg := msg.(type) {
+			case tea.KeyMsg:
+				switch msg.Type {
+				case tea.KeyCtrlS:
+					if m.previousView == viewDeployments {
+						d := m.deployments[m.cursor]
+						return m, patchDeployment(m.clientset, d.Namespace, d.Name, m.editor.Value())
+					}
+					if m.previousView == viewResourceQuotas {
+						rq := m.resourcequotas[m.cursor]
+						return m, patchResourceQuota(m.clientset, rq.Namespace, rq.Name, m.editor.Value())
+					}
+				case tea.KeyEsc:
+					m.view = viewDetails
+					m.editor.Reset()
+				}
+			}
+			var cmd tea.Cmd
+			m.editor, cmd = m.editor.Update(msg)
+			cmds = append(cmds, cmd)
 			return m, tea.Batch(cmds...)
 		}
 		if m.view == viewLogs {
@@ -743,6 +808,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.view = viewScaling
 					m.textInput.Focus()
 					m.textInput.SetValue(fmt.Sprintf("%d", *m.deployments[m.cursor].Spec.Replicas))
+					return m, nil
+				}
+			case "e":
+				if m.previousView == viewDeployments {
+					m.view = viewEdit
+					d := m.deployments[m.cursor]
+					s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme, scheme.Scheme)
+					var b bytes.Buffer
+					if err := s.Encode(&d, &b); err == nil {
+						m.editor.SetValue(b.String())
+					}
+					m.editor.Focus()
+					return m, nil
+				}
+				if m.previousView == viewResourceQuotas {
+					m.view = viewEdit
+					rq := m.resourcequotas[m.cursor]
+					s := json.NewYAMLSerializer(json.DefaultMetaFactory, scheme.Scheme, scheme.Scheme)
+					var b bytes.Buffer
+					if err := s.Encode(&rq, &b); err == nil {
+						m.editor.SetValue(b.String())
+					}
+					m.editor.Focus()
 					return m, nil
 				}
 			case "l":
@@ -981,6 +1069,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.details = m.formatNetworkPolicyDetails(m.netpols[m.cursor])
 			case viewEvents:
 				m.details = m.formatEventDetails(m.events[m.cursor])
+			case viewResourceQuotas:
+				m.details = m.formatResourceQuotaDetails(m.resourcequotas[m.cursor])
 			}
 			return m, nil
 		}
@@ -1028,6 +1118,15 @@ func (m model) headerView() string {
 		title = "Help"
 	case viewDetails:
 		title = "Details"
+	case viewEdit:
+		if m.previousView == viewDeployments {
+			d := m.deployments[m.cursor]
+			title = fmt.Sprintf("Editing Deployment: %s", d.Name)
+		}
+		if m.previousView == viewResourceQuotas {
+			rq := m.resourcequotas[m.cursor]
+			title = fmt.Sprintf("Editing Resource Quota: %s", rq.Name)
+		}
 	case viewLogs:
 		pod := m.pods[m.cursor]
 		title = fmt.Sprintf("Logs for %s", pod.Name)
@@ -1058,7 +1157,9 @@ func (m model) footerView() string {
 		case viewPods:
 			baseHelp += " | (l)ogs | (d)elete | (y)aml"
 		case viewDeployments:
-			baseHelp += " | (r)eplicas | (y)aml"
+			baseHelp += " | (r)eplicas | (e)dit | (y)aml"
+		case viewResourceQuotas:
+			baseHelp += " | (e)dit | (y)aml"
 		default:
 			baseHelp += " | (y)aml"
 		}
@@ -1072,6 +1173,9 @@ func (m model) footerView() string {
 	}
 	if m.view == viewScaling {
 		help = "(enter) confirm | (esc) cancel"
+	}
+	if m.view == viewEdit {
+		help = "(ctrl+s) save | (esc) cancel"
 	}
 	if m.view == viewConfirmDelete {
 		help = "(y)es / (n)o"
@@ -1098,6 +1202,11 @@ func (m model) View() string {
 	} else if m.view == viewYAML { // New case for YAML view
 		m.viewport.SetContent(m.yamlContent)
 		finalView = fmt.Sprintf("%s\n%s\n%s", m.headerView(), m.viewport.View(), m.footerView())
+	} else if m.view == viewEdit {
+		var b strings.Builder
+		b.WriteString(m.editor.View())
+		viewContent := b.String()
+		finalView = lipgloss.JoinVertical(lipgloss.Left, m.headerView(), viewContent, m.footerView())
 	} else if m.view == viewScaling {
 		var b strings.Builder
 		b.WriteString(m.details)
@@ -1178,9 +1287,31 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    y: View YAML\n\n")
 	b.WriteString("  Details View (Deployments):\n")
 	b.WriteString("    r: Scale replicas\n")
+	b.WriteString("    e: Edit deployment\n")
 	b.WriteString("    y: View YAML\n\n")
+	b.WriteString("  Details View (Resource Quotas):\n")
+	b.WriteString("    e: Edit resource quota\n")
+	b.WriteString("    y: View YAML\n\n")
+	b.WriteString("  Edit View:\n")
+	b.WriteString("    ctrl+s: Save changes\n")
+	b.WriteString("    esc: Cancel\n\n")
 	b.WriteString("  Other Details Views:\n")
 	b.WriteString("    y: View YAML\n")
+	return b.String()
+}
+
+func (m *model) formatResourceQuotaDetails(rq v1.ResourceQuota) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", rq.Name))
+	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", rq.Namespace))
+	b.WriteString("\n" + m.styles.HeaderText.Render("Hard Limits") + "\n")
+	for resourceName, limit := range rq.Spec.Hard {
+		b.WriteString(fmt.Sprintf("  - %s:\t%s\n", resourceName, limit.String()))
+	}
+	b.WriteString("\n" + m.styles.HeaderText.Render("Used") + "\n")
+	for resourceName, used := range rq.Status.Used {
+		b.WriteString(fmt.Sprintf("  - %s:\t%s\n", resourceName, used.String()))
+	}
 	return b.String()
 }
 
@@ -1190,7 +1321,7 @@ func (m *model) renderResourceQuotasList() string {
 		return "No Resource Quotas found."
 	}
 
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"30s %-"+"20s %-"+"20s", "NAME", "RESOURCE", "USED", "LIMIT"))
+	header := m.styles.Header.Render(fmt.Sprintf("%-40s %-30s %-20s %-20s", "NAME", "RESOURCE", "USED", "LIMIT"))
 	b.WriteString(header + "\n")
 
 	for i, lineData := range m.resourceQuotaLines {
@@ -1199,7 +1330,7 @@ func (m *model) renderResourceQuotasList() string {
 			style = m.styles.SelectedRow
 		}
 
-		line := fmt.Sprintf("%-"+"40s %-"+"30s %-"+"20s %-"+"20s", lineData.Name, lineData.Resource, lineData.Used, lineData.Limit)
+		line := fmt.Sprintf("%-40s %-30s %-20s %-20s", lineData.Name, lineData.Resource, lineData.Used, lineData.Limit)
 		b.WriteString(style.Render(line) + "\n")
 	}
 	return b.String()
@@ -1211,7 +1342,7 @@ func (m *model) renderAlertsList() string {
 		return "No Alerts found."
 	}
 
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"))
+	header := m.styles.Header.Render(fmt.Sprintf("%-15s %-10s %-20s %-30s %s", "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"))
 	b.WriteString(header + "\n")
 
 	for i, a := range m.alerts {
@@ -1226,7 +1357,7 @@ func (m *model) renderAlertsList() string {
 
 		typeStyle := m.styles.Warning
 
-		line := fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", ts, typeStyle.Render(a.Type), a.Reason, obj, msg)
+		line := fmt.Sprintf("%-15s %-10s %-20s %-30s %s", ts, typeStyle.Render(a.Type), a.Reason, obj, msg)
 		b.WriteString(style.Render(line) + "\n")
 	}
 	return b.String()
@@ -1997,11 +2128,17 @@ func main() {
 	ti.CharLimit = 3
 	ti.Width = 5
 
+	editor := textarea.New()
+	editor.Placeholder = "Enter patch here"
+	editor.SetWidth(80)
+	editor.SetHeight(10)
+
 	initialModel := model{
 		clientset:        clientset,
 		metricsClientset: metricsClientset,
 		styles:           defaultStyles(),
 		textInput:        ti,
+		editor:           editor,
 		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events", "Alerts", "Resource Quotas"},
 	}
 
