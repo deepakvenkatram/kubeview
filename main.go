@@ -53,9 +53,18 @@ const (
 	viewConfirmDelete
 	viewYAML
 	viewDashboard // New view state for Dashboard
+	viewResourceQuotas
+	viewAlerts
 	viewResourceMenu
 	viewHelp
 )
+
+type alert struct {
+	ResourceName string
+	ResourceType string
+	Message      string
+	Severity     string // e.g., "Critical", "Warning"
+}
 
 type model struct {
 	view               viewState
@@ -71,8 +80,10 @@ type model struct {
 	daemonsets         []appsv1.DaemonSet
 	services           []v1.Service
 	netpols            []networkingv1.NetworkPolicy
+	resourcequotas     []v1.ResourceQuota
 	events             []v1.Event
 	namespaces         []v1.Namespace
+	alerts             []alert
 	resourceTypes      []string
 	selectedNamespace  string // "" == all
 	details            string
@@ -112,6 +123,8 @@ type statefulsetsMsg struct{ statefulsets []appsv1.StatefulSet }
 type daemonsetsMsg struct{ daemonsets []appsv1.DaemonSet }
 type servicesMsg struct{ services []v1.Service }
 type networkPoliciesMsg struct{ policies []networkingv1.NetworkPolicy }
+type resourceQuotasMsg struct{ resourcequotas []v1.ResourceQuota }
+type alertsMsg struct{ alerts []alert }
 type eventsMsg struct{ events []v1.Event }
 type namespacesMsg struct{ namespaces []v1.Namespace }
 type errMsg struct{ err error }
@@ -282,6 +295,56 @@ func getNetworkPolicies(clientset *kubernetes.Clientset, namespace string) tea.C
 	}
 }
 
+func getResourceQuotas(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
+	return func() tea.Msg {
+		resourcequotas, err := clientset.CoreV1().ResourceQuotas(namespace).List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return resourceQuotasMsg{resourcequotas.Items}
+	}
+}
+
+func getAlerts(clientset *kubernetes.Clientset) tea.Cmd {
+	return func() tea.Msg {
+		var alerts []alert
+
+		// Check node status
+		nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		for _, node := range nodes.Items {
+			if getNodeStatus(node) != "Ready" {
+				alerts = append(alerts, alert{
+					ResourceName: node.Name,
+					ResourceType: "Node",
+					Message:      "Node is not in a ready state",
+					Severity:     "Critical",
+				})
+			}
+		}
+
+		// Check pod status
+		pods, err := clientset.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{}) // All namespaces
+		if err != nil {
+			return errMsg{err}
+		}
+		for _, pod := range pods.Items {
+			if pod.Status.Phase == "Failed" {
+				alerts = append(alerts, alert{
+					ResourceName: pod.Name,
+					ResourceType: "Pod",
+					Message:      "Pod is in a failed state",
+					Severity:     "Critical",
+				})
+			}
+		}
+
+		return alertsMsg{alerts}
+	}
+}
+
 func getEvents(clientset *kubernetes.Clientset, namespace string) tea.Cmd {
 	return func() tea.Msg {
 		events, err := clientset.CoreV1().Events(namespace).List(context.Background(), metav1.ListOptions{})
@@ -328,6 +391,8 @@ func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind stri
 			obj, err = clientset.CoreV1().PersistentVolumes().Get(context.Background(), name, metav1.GetOptions{})
 		case "NetworkPolicy":
 			obj, err = clientset.NetworkingV1().NetworkPolicies(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		case "ResourceQuota":
+			obj, err = clientset.CoreV1().ResourceQuotas(namespace).Get(context.Background(), name, metav1.GetOptions{})
 		case "Node":
 			obj, err = clientset.CoreV1().Nodes().Get(context.Background(), name, metav1.GetOptions{})
 		case "Event":
@@ -532,6 +597,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getServices(m.clientset, m.selectedNamespace)
 		case viewNetworkPolicies:
 			return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
+		case viewResourceQuotas:
+			return m, getResourceQuotas(m.clientset, m.selectedNamespace)
+		case viewAlerts:
+			return m, getAlerts(m.clientset)
 		case viewEvents:
 			return m, getEvents(m.clientset, m.selectedNamespace)
 		case viewDashboard:
@@ -592,6 +661,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, doTick()
 	case networkPoliciesMsg:
 		m.netpols = msg.policies
+		m.cursor = 0
+		return m, doTick()
+	case resourceQuotasMsg:
+		m.resourcequotas = msg.resourcequotas
+		m.cursor = 0
+		return m, doTick()
+	case alertsMsg:
+		m.alerts = msg.alerts
 		m.cursor = 0
 		return m, doTick()
 	case eventsMsg:
@@ -717,6 +794,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					name = m.netpols[m.cursor].Name
 					namespace = m.netpols[m.cursor].Namespace
 					kind = "NetworkPolicy"
+				case viewResourceQuotas:
+					name = m.resourcequotas[m.cursor].Name
+					namespace = m.resourcequotas[m.cursor].Namespace
+					kind = "ResourceQuota"
 				case viewEvents:
 					name = m.events[m.cursor].Name
 					namespace = m.events[m.cursor].Namespace
@@ -798,6 +879,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "Network Policies":
 					m.view = viewNetworkPolicies
 					return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
+				case "Resource Quotas":
+					m.view = viewResourceQuotas
+					return m, getResourceQuotas(m.clientset, m.selectedNamespace)
 				case "Events":
 					m.view = viewEvents
 					return m, getEvents(m.clientset, m.selectedNamespace)
@@ -836,6 +920,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previousView = m.view
 			m.view = viewDashboard
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+		case "A":
+			m.previousView = m.view
+			m.view = viewAlerts
+			return m, getAlerts(m.clientset)
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
@@ -861,6 +949,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				listLen = len(m.services)
 			case viewNetworkPolicies:
 				listLen = len(m.netpols)
+			case viewResourceQuotas:
+				listLen = len(m.resourcequotas)
+			case viewAlerts:
+				listLen = len(m.alerts)
 			case viewEvents:
 				listLen = len(m.events)
 			}
@@ -893,6 +985,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.details = m.formatServiceDetails(m.services[m.cursor])
 			case viewNetworkPolicies:
 				m.details = m.formatNetworkPolicyDetails(m.netpols[m.cursor])
+			case viewResourceQuotas:
+				m.details = m.formatResourceQuotaDetails(m.resourcequotas[m.cursor])
 			case viewEvents:
 				m.details = m.formatEventDetails(m.events[m.cursor])
 			}
@@ -928,6 +1022,10 @@ func (m model) headerView() string {
 		title = fmt.Sprintf("Services in %s", nsText)
 	case viewNetworkPolicies:
 		title = fmt.Sprintf("Network Policies in %s", nsText)
+	case viewResourceQuotas:
+		title = fmt.Sprintf("ResourceQuotas in %s", nsText)
+	case viewAlerts:
+		title = "Alerts"
 	case viewEvents:
 		title = fmt.Sprintf("Events in %s", nsText)
 	case viewNamespaces:
@@ -960,7 +1058,7 @@ func (m model) footerView() string {
 		return m.styles.Muted.Render("(esc) back")
 	}
 
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
+	help := "(q)uit | (r)esources | (D)ash | (A)lerts | (N)s | (?) help"
 
 	if m.view == viewDetails {
 		baseHelp := "(esc) back"
@@ -1044,6 +1142,10 @@ func (m model) View() string {
 			viewContent = m.renderServicesList()
 		case viewNetworkPolicies:
 			viewContent = m.renderNetworkPoliciesList()
+		case viewResourceQuotas:
+			viewContent = m.renderResourceQuotasList()
+		case viewAlerts:
+			viewContent = m.renderAlertsList()
 		case viewEvents:
 			viewContent = m.renderEventsList()
 		case viewNamespaces:
@@ -1085,6 +1187,49 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    y: View YAML\n\n")
 	b.WriteString("  Other Details Views:\n")
 	b.WriteString("    y: View YAML\n")
+	return b.String()
+}
+
+func (m *model) renderAlertsList() string {
+	var b strings.Builder
+	if len(m.alerts) == 0 {
+		return "No alerts to display."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-"+"20s %-"+"20s %-"+"50s %s", "SEVERITY", "RESOURCE TYPE", "RESOURCE NAME", "MESSAGE"))
+	b.WriteString(header + "\n")
+
+	for i, a := range m.alerts {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+
+		severityStyle := m.styles.Success
+		if a.Severity == "Critical" {
+			severityStyle = m.styles.Error
+		} else if a.Severity == "Warning" {
+			severityStyle = m.styles.Warning
+		}
+
+		line := fmt.Sprintf("%-"+"20s %-"+"20s %-"+"50s %s", severityStyle.Render(a.Severity), a.ResourceType, a.ResourceName, a.Message)
+		b.WriteString(style.Render(line) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) formatResourceQuotaDetails(p v1.ResourceQuota) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", p.Name))
+	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", p.Namespace))
+	b.WriteString("\n" + m.styles.HeaderText.Render("Hard") + "\n")
+	for k, v := range p.Spec.Hard {
+		b.WriteString(fmt.Sprintf("%s:\t%s\n", k, v.String()))
+	}
+	b.WriteString("\n" + m.styles.HeaderText.Render("Used") + "\n")
+	for k, v := range p.Status.Used {
+		b.WriteString(fmt.Sprintf("%s:\t%s\n", k, v.String()))
+	}
 	return b.String()
 }
 
@@ -1168,6 +1313,27 @@ func (m *model) renderNetworkPoliciesList() string {
 		}
 		selector, _ := metav1.LabelSelectorAsSelector(&p.Spec.PodSelector)
 		line := fmt.Sprintf("%-"+"50s %s", p.Name, selector.String())
+		b.WriteString(style.Render(line) + "\n")
+	}
+	return b.String()
+}
+
+func (m *model) renderResourceQuotasList() string {
+	var b strings.Builder
+	if len(m.resourcequotas) == 0 {
+		return "No ResourceQuotas."
+	}
+
+	header := m.styles.Header.Render(fmt.Sprintf("%-"+"50s %s", "NAME", "AGE"))
+	b.WriteString(header + "\n")
+
+	for i, p := range m.resourcequotas {
+		style := m.styles.Row
+		if m.cursor == i {
+			style = m.styles.SelectedRow
+		}
+		age := p.CreationTimestamp.Time.Format("2006-01-02 15:04:05")
+		line := fmt.Sprintf("%-"+"50s %s", p.Name, age)
 		b.WriteString(style.Render(line) + "\n")
 	}
 	return b.String()
@@ -1858,7 +2024,7 @@ func main() {
 		metricsClientset: metricsClientset,
 		styles:           defaultStyles(),
 		textInput:        ti,
-		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events"},
+		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Resource Quotas", "Events"},
 	}
 
 	p := tea.NewProgram(initialModel, tea.WithAltScreen())
