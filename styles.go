@@ -18,21 +18,25 @@ func defaultStyles() Styles {
 	s := Styles{}
 
 	s.Base = lipgloss.NewStyle().
-		Padding(1, 2)
+		Padding(1, 2).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240"))
 
 	s.HeaderText = lipgloss.NewStyle().
-		Bold(true)
+		Bold(true).
+		Foreground(lipgloss.Color("212"))
 
 	s.Header = lipgloss.NewStyle().
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderBottom(true).
+		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1)
 
 	s.Row = lipgloss.NewStyle().
 		Padding(0, 1)
 
 	s.SelectedRow = s.Row.Copy().
-		Background(lipgloss.Color("240")).
+		Background(lipgloss.Color("238")).
 		Foreground(lipgloss.Color("255"))
 
 	s.Success = lipgloss.NewStyle().
