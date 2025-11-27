@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"kubeview/host"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -55,6 +56,9 @@ const (
 	viewDashboard // New view state for Dashboard
 	viewResourceMenu
 	viewHelp
+	viewHost
+	viewHostLogsMenu
+	viewHostLogs
 )
 
 type model struct {
@@ -90,6 +94,10 @@ type model struct {
 	styles             Styles
 	viewport           viewport.Model
 	textInput          textinput.Model
+	hostLogTypes       []string
+	hostCPUUsage       string
+	hostMemoryUsage    string
+	hostDiskUsage      []host.DiskUsageStat
 	ready              bool
 }
 
@@ -538,6 +546,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
 		}
 		return m, doTick()
+	case host.HostMsg:
+		m.hostCPUUsage = msg.CpuUsage
+		m.hostMemoryUsage = msg.MemoryUsage
+		m.hostDiskUsage = msg.DiskUsage
+		return m, nil
+	case host.HostLogsMsg:
+		m.viewport.SetContent(msg.Logs)
+		m.view = viewHostLogs
+		return m, nil
 	case logsMsg:
 		m.viewport.SetContent(msg.logs)
 		m.view = viewLogs
@@ -735,6 +752,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.view == viewHost {
+			switch msg.String() {
+			case "l":
+				m.previousView = m.view
+				m.view = viewHostLogsMenu
+				m.cursor = 0
+				return m, nil
+			case "esc", "backspace":
+				m.view = m.previousView
+			}
+			return m, nil
+		}
+		if m.view == viewHostLogsMenu {
+			switch msg.String() {
+			case "enter":
+				logType := m.hostLogTypes[m.cursor]
+				return m, host.GetHostLogs(logType)
+			case "esc", "backspace":
+				m.view = viewHost
+				m.cursor = 0
+			case "up":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down":
+				if m.cursor < len(m.hostLogTypes)-1 {
+					m.cursor++
+				}
+			}
+			return m, nil
+		}
+		if m.view == viewHostLogs {
+			switch msg.String() {
+			case "esc", "backspace", "q":
+				m.view = viewHostLogsMenu
+			default:
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+			return m, tea.Batch(cmds...)
+		}
 		if m.view == viewHelp {
 			switch msg.String() {
 			case "esc", "backspace", "q", "?":
@@ -836,6 +894,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previousView = m.view
 			m.view = viewDashboard
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+		case "H":
+			m.previousView = m.view
+			m.view = viewHost
+			return m, host.GetHostMetrics()
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
@@ -951,6 +1013,12 @@ func (m model) headerView() string {
 		title = "YAML Details"
 	case viewDashboard: // New case
 		title = "Cluster Dashboard"
+	case viewHost:
+		title = "Host Metrics"
+	case viewHostLogsMenu:
+		title = "Select Host Log Type"
+	case viewHostLogs:
+		title = "Host Logs"
 	}
 	return m.styles.HeaderText.Render(title)
 }
@@ -960,8 +1028,10 @@ func (m model) footerView() string {
 		return m.styles.Muted.Render("(esc) back")
 	}
 
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
-
+	help := "(q)uit | (r)esources | (D)ash | (H)ost | (N)s | (?) help"
+	if m.view == viewHost {
+		help += " | (l)ogs"
+	}
 	if m.view == viewDetails {
 		baseHelp := "(esc) back"
 		switch m.previousView {
@@ -1054,6 +1124,10 @@ func (m model) View() string {
 			viewContent = m.renderHelpView()
 		case viewDashboard: // New case
 			viewContent = m.renderDashboard()
+		case viewHost:
+			viewContent = host.RenderHostView(m.styles.HeaderText, m.styles.Header, m.styles.Row, m.hostCPUUsage, m.hostMemoryUsage, m.hostDiskUsage)
+		case viewHostLogsMenu:
+			viewContent = host.RenderHostLogsMenu(m.styles.HeaderText, m.styles.Row, m.styles.SelectedRow, m.cursor, m.hostLogTypes)
 		default: // viewNodes
 			viewContent = m.renderNodesList()
 		}
@@ -1859,6 +1933,7 @@ func main() {
 		styles:           defaultStyles(),
 		textInput:        ti,
 		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events"},
+		hostLogTypes:     []string{"System Logs", "Kubelet Logs", "Docker Logs"},
 	}
 
 	p := tea.NewProgram(initialModel, tea.WithAltScreen())
