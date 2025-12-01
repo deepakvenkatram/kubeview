@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NimbleMarkets/ntcharts"
+	"github.com/NimbleMarkets/ntcharts/barchart"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -84,9 +84,7 @@ type model struct {
 	yamlContent        string // New field for YAML content
 	clusterCPUUsage    string // Aggregated cluster CPU usage
 	clusterMemoryUsage string // Aggregated cluster Memory usage
-	cpuUsage           float64
-	memUsage           float64
-	diskUsage          float64
+	hostChart          barchart.Model
 	topPodsByCPU       []v1.Pod  // Top pods by CPU usage
 	topPodsByMemory    []v1.Pod  // Top pods by Memory usage
 	topNodesByCPU      []v1.Node // Top nodes by CPU usage
@@ -102,12 +100,12 @@ type model struct {
 }
 
 type tickMsg time.Time
-type logsMsg struct{ logs string }
 type hostMetricsMsg struct {
 	cpuUsage  float64
 	memUsage  float64
 	diskUsage float64
 }
+type logsMsg struct{ logs string }
 type scaleMsg struct{}
 type podDeletedMsg struct{}
 type nodesMsg struct {
@@ -577,9 +575,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, doTick()
 	case hostMetricsMsg:
-		m.cpuUsage = msg.cpuUsage
-		m.memUsage = msg.memUsage
-		m.diskUsage = msg.diskUsage
+		m.hostChart.PushAll([]barchart.BarData{
+			{
+				Label: "CPU",
+				Values: []barchart.BarValue{
+					{Value: msg.cpuUsage},
+				},
+			},
+			{
+				Label: "Memory",
+				Values: []barchart.BarValue{
+					{Value: msg.memUsage},
+				},
+			},
+			{
+				Label: "Disk",
+				Values: []barchart.BarValue{
+					{Value: msg.diskUsage},
+				},
+			},
+		})
+		m.hostChart.Draw()
 		return m, doTick()
 	case logsMsg:
 		m.viewport.SetContent(msg.logs)
@@ -882,6 +898,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "H":
 			m.previousView = m.view
 			m.view = viewHost
+			m.hostChart = barchart.New(75, 20)
 			return m, getHostMetrics()
 		case "up":
 			if m.cursor > 0 {
@@ -1115,23 +1132,7 @@ func (m model) View() string {
 }
 
 func (m *model) renderHostView() string {
-	var b strings.Builder
-
-	cpuChart := ntcharts.NewPercentageChart()
-	cpuChart.SetTitle("CPU Usage")
-	cpuChart.SetData(m.cpuUsage)
-
-	memChart := ntcharts.NewPercentageChart()
-	memChart.SetTitle("Memory Usage")
-	memChart.SetData(m.memUsage)
-
-	diskChart := ntcharts.NewPercentageChart()
-	diskChart.SetTitle("Disk Usage")
-	diskChart.SetData(m.diskUsage)
-
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, cpuChart.Render(), memChart.Render(), diskChart.Render()))
-
-	return b.String()
+	return m.hostChart.View()
 }
 func (m *model) renderHelpView() string {
 	var b strings.Builder
