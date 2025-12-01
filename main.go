@@ -1026,6 +1026,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case viewResourceMenu:
 				selected := m.resourceTypes[m.cursor]
 				switch selected {
+				case "Cluster Dashboard":
+					m.setView(viewDashboard)
+					return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
+				case "Host Dashboard":
+					m.setView(viewHostDashboard)
+					return m, getHostMetrics()
 				case "Nodes":
 					m.setView(viewNodes)
 					return m, getNodes(m.clientset, m.metricsClientset)
@@ -1749,7 +1755,7 @@ func main() {
 
 func initialModel(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) model {
 	styles := DefaultStyles()
-	resourceTypes := []string{"Namespaces", "Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PersistentVolumeClaims", "PersistentVolumes", "NetworkPolicies", "Events"}
+	resourceTypes := []string{"Cluster Dashboard", "Host Dashboard", "Namespaces", "Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PersistentVolumeClaims", "PersistentVolumes", "NetworkPolicies", "Events"}
 	hostLogTypes := []string{"System Logs", "Kubelet Logs", "Docker Logs", "dmesg"}
 
 	return model{
