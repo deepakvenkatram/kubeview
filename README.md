@@ -237,7 +237,7 @@ KubeView is an interactive TUI. Use the following keybindings to navigate the ap
 ### Details View (Pods)
 
 *   **l:** View logs
-*   **d:** Delete pod
+*   **X:** Delete pod
 *   **y:** View YAML
 
 ### Details View (Deployments)

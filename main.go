@@ -1009,7 +1009,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Focus()
 				m.setView(viewScaling)
 			}
-		case "D": // Delete
+		case "X": // Delete
 			if m.view == viewPods {
 				m.setView(viewConfirmDelete)
 			}
@@ -1173,7 +1173,7 @@ func renderHelp() string {
  (y) - View YAML for the selected resource
  (L) - View logs for the selected pod
  (S) - Scale the selected deployment
- (D) - Delete the selected pod
+ (X) - Delete the selected pod
 `
 }
 
