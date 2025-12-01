@@ -32,6 +32,15 @@ KubeView aims to simplify the monitoring and understanding of Kubernetes cluster
 *   Real-time updates of cluster status.
 *   Easy navigation through different Kubernetes resources.
 *   Lightweight and efficient, built with Go.
+*   **Host-Level Monitoring:** View real-time metrics of your local machine, including CPU, memory, and disk usage, which is particularly useful for monitoring local clusters like `k3s` or `minikube`.
+
+## Screenshots
+
+### Host Metrics View
+
+![Host Metrics](https://i.imgur.com/your-image.png)
+
+*The Host Metrics view provides a real-time overview of your local machine's resource utilization.*
 
 ## Prerequisites
 
@@ -179,6 +188,11 @@ Replace `/etc/rancher/k3s/k3s.yaml` with the actual path to your Kubeconfig file
 ## Usage
 
 (This section will be expanded as KubeView features are developed. For now, it will launch the TUI.)
+
+KubeView uses the following third-party libraries:
+
+*   [gopsutil](https://github.com/shirou/gopsutil) for fetching host-level metrics.
+*   [ntcharts](https://github.com/NimbleMarkets/ntcharts) for displaying terminal-based charts.
 
 ## Project Structure
 
