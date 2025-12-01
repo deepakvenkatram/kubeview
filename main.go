@@ -906,18 +906,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor < len(m.namespaces)-1 {
 					m.cursor++
 				}
-			case viewHostLogs:
-				if m.cursor < len(m.hostLogTypes)-1 {
-					m.cursor++
-				}
-			case viewAppLogs:
-				if m.cursor < len(m.containers)-1 {
-					m.cursor++
+			case viewHostDashboard:
+				switch m.hostTabs[m.activeHostTab] {
+				case "System Logs":
+					if m.cursor < len(m.hostLogTypes)-1 {
+						m.cursor++
+					}
+				case "Application Logs":
+					if m.cursor < len(m.containers)-1 {
+						m.cursor++
+					}
 				}
 			}
 		case "right", "l":
 			if m.view == viewHostDashboard {
 				m.activeHostTab = (m.activeHostTab + 1) % len(m.hostTabs)
+				m.details = ""
+				m.viewport.SetContent("")
+				m.cursor = 0
 				if m.hostTabs[m.activeHostTab] == "Application Logs" {
 					return m, getContainers()
 				}
@@ -1061,14 +1067,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedNamespace = m.namespaces[m.cursor-1].Name
 				}
 				m.setView(viewResourceMenu)
-			case viewHostLogs:
-				selectedLogType := m.hostLogTypes[m.cursor]
-				m.setView(viewDetails) // Switch to a generic detail view for logs
-				return m, getHostLogs(selectedLogType)
-			case viewAppLogs:
-				selectedContainer := m.containers[m.cursor]
-				m.setView(viewDetails)
-				return m, getContainerLogs(selectedContainer)
+			case viewHostDashboard:
+				switch m.hostTabs[m.activeHostTab] {
+				case "System Logs":
+					selectedLogType := m.hostLogTypes[m.cursor]
+					return m, getHostLogs(selectedLogType)
+				case "Application Logs":
+					if len(m.containers) > 0 {
+						selectedContainer := m.containers[m.cursor]
+						return m, getContainerLogs(selectedContainer)
+					}
+				}
 			}
 
 		case "H": // Go to Host Dashboard
@@ -1135,10 +1144,6 @@ func (m model) View() string {
 		s.WriteString(renderDashboard(m))
 	case viewHostDashboard:
 		s.WriteString(renderHostDashboard(m))
-	case viewHostLogs:
-		s.WriteString(renderHostLogsMenu(m))
-	case viewAppLogs:
-		s.WriteString(renderAppLogsMenu(m))
 	}
 
 	s.WriteString(renderFooter(m))
@@ -1505,9 +1510,13 @@ func renderHostDashboard(m model) string {
 	case "Host Metrics":
 		sb.WriteString(renderHostMetrics(m))
 	case "System Logs":
-		sb.WriteString(renderHostLogsMenu(m)) // Reuse the logs menu view
+		left := renderHostLogsMenu(m)
+		right := m.viewport.View()
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
 	case "Application Logs":
-		sb.WriteString(renderAppLogsMenu(m)) // New view for app logs
+		left := renderAppLogsMenu(m)
+		right := m.viewport.View()
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
 	}
 
 	return sb.String()
