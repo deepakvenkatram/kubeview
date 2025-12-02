@@ -6,21 +6,22 @@ KubeView is a command-line interface (CLI) tool written in Go that provides a re
 
 1.  [Project Overview](#project-overview)
 2.  [Features](#features)
-3.  [Prerequisites](#prerequisites)
+3.  [Screenshots](#screenshots)
+4.  [Prerequisites](#prerequisites)
     *   [Go Programming Language](#go-programming-language)
     *   [K3s Kubernetes Distribution](#k3s-kubernetes-distribution)
     *   [Kubernetes Metrics Server](#kubernetes-metrics-server)
-4.  [Installation Guide](#installation-guide)
+5.  [Installation Guide](#installation-guide)
     *   [Install Go](#install-go)
     *   [Install K3s](#install-k3s)
     *   [Install Kubernetes Metrics Server](#install-kubernetes-metrics-server)
     *   [Install KubeView Dependencies](#install-kubeview-dependencies)
     *   [Build KubeView](#build-kubeview)
-5.  [Running KubeView](#running-kubeview)
-6.  [Usage](#usage)
-7.  [Project Structure](#project-structure)
-8.  [Contributing](#contributing)
-9.  [License](#license)
+6.  [Running KubeView](#running-kubeview)
+7.  [Usage](#usage)
+8.  [Project Structure](#project-structure)
+9.  [Contributing](#contributing)
+10. [License](#license)
 
 ## Project Overview
 
@@ -28,10 +29,52 @@ KubeView aims to simplify the monitoring and understanding of Kubernetes cluster
 
 ## Features
 
-*   Interactive terminal UI for Kubernetes resource visualization.
-*   Real-time updates of cluster status.
-*   Easy navigation through different Kubernetes resources.
-*   Lightweight and efficient, built with Go.
+*   **Interactive Terminal UI:** Visualize your Kubernetes resources in a user-friendly, terminal-based interface.
+*   **Real-time Updates:** Get real-time updates of your cluster's status.
+*   **Categorized Resource Menu:** Navigate through a reorganized, categorized resource menu.
+*   **Graphical Dashboard:** View a graphical dashboard with charts for resource utilization.
+*   **Lightweight and Efficient:** Built with Go for optimal performance.
+
+## Screenshots
+
+### Dashboard View
+
+```
+ Cluster Dashboard
+ ────────────────────────────────────────────────────────────────────────────────────────────────
+ Cluster-wide Resource Usage
+   CPU: 100m / 1000m (10%)
+   Memory: 500Mi / 2048Mi (24%)
+
+ Top Pods by CPU Usage
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                       Top Pods by CPU Usage                                  │
+ │                                                                                              │
+ │   nginx-deployment-5f5d8f6c8c-l5z8z    बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा  100m│
+ │   coredns-5f5d8f6c8c-l5z8z          बारा बारा बारा बारा बारा बारा बारा                         50m│
+ │   metrics-server-5f5d8f6c8c-l5z8z   बारा बारा बारा बारा                                        20m│
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ Top Pods by Memory Usage
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │                                     Top Pods by Memory Usage                                 │
+ │                                                                                              │
+ │   nginx-deployment-5f5d8f6c8c-l5z8z बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा बारा 200Mi│
+ │   coredns-5f5d8f6c8c-l5z8z           बारा बारा बारा बारा बारा                                 100Mi│
+ │   metrics-server-5f5d8f6c8c-l5z8z   बारा बारा                                                 50Mi│
+ └──────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Resource Menu
+
+```
+ Select Resource Category
+ ────────────────────────────────────────────────────────────────────────────────────────────────
+ > Workloads
+   Storage
+   Network
+   Cluster
+```
 
 ## Prerequisites
 
@@ -153,7 +196,7 @@ The Metrics Server provides resource usage data for pods and nodes, which KubeVi
 Navigate to the `kubeview` project directory and install the Go modules.
 
 ```bash
-cd /home/my-projects/awskubeview/
+cd /path/to/kubeview
 go mod tidy
 ```
 
@@ -162,8 +205,8 @@ go mod tidy
 Build the KubeView executable:
 
 ```bash
-cd /home/my-projects/aws/kubeview/
-go build -o kubeview main.go
+cd /path/to/kubeview
+go build -o kubeview .
 ```
 This will create an executable named `kubeview` in your current directory.
 
@@ -178,7 +221,29 @@ Replace `/etc/rancher/k3s/k3s.yaml` with the actual path to your Kubeconfig file
 
 ## Usage
 
-(This section will be expanded as KubeView features are developed. For now, it will launch the TUI.)
+KubeView is an interactive TUI. Use the following keybindings to navigate the application:
+
+**Note:** The host log viewing feature requires Linux-based tools like `journalctl` and `dmesg`.
+
+*   **q, ctrl+c:** Quit
+*   **?:** Show this help view
+*   **r:** Open resource selection menu
+*   **D:** Show cluster dashboard
+*   **N:** Select namespace
+*   **up/down:** Move cursor
+*   **enter:** Select / View details
+*   **esc:** Go back
+
+### Details View (Pods)
+
+*   **L:** View logs
+*   **X:** Delete pod
+*   **y:** View YAML
+
+### Details View (Deployments)
+
+*   **S:** Scale replicas
+*   **y:** View YAML
 
 ## Project Structure
 
