@@ -846,6 +846,62 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
+		case "L":
+			if m.view == viewDetails && m.previousView == viewPods {
+				pod := m.pods[m.cursor]
+				m.setView(viewLogs)
+				return m, getLogs(m.clientset, pod.Namespace, pod.Name)
+			}
+		case "X":
+			if m.view == viewDetails && m.previousView == viewPods {
+				m.setView(viewConfirmDelete)
+			}
+		case "y":
+			if m.view == viewDetails {
+				var namespace, name, kind string
+				switch m.previousView {
+				case viewNodes:
+					node := m.nodes[m.cursor]
+					namespace, name, kind = "", node.Name, "Node"
+				case viewPods:
+					pod := m.pods[m.cursor]
+					namespace, name, kind = pod.Namespace, pod.Name, "Pod"
+				case viewPVCs:
+					pvc := m.pvcs[m.cursor]
+					namespace, name, kind = pvc.Namespace, pvc.Name, "PersistentVolumeClaim"
+				case viewPVs:
+					pv := m.pvs[m.cursor]
+					namespace, name, kind = "", pv.Name, "PersistentVolume"
+				case viewDeployments:
+					deployment := m.deployments[m.cursor]
+					namespace, name, kind = deployment.Namespace, deployment.Name, "Deployment"
+				case viewStatefulSets:
+					statefulset := m.statefulsets[m.cursor]
+					namespace, name, kind = statefulset.Namespace, statefulset.Name, "StatefulSet"
+				case viewDaemonSets:
+					daemonset := m.daemonsets[m.cursor]
+					namespace, name, kind = daemonset.Namespace, daemonset.Name, "DaemonSet"
+				case viewServices:
+					service := m.services[m.cursor]
+					namespace, name, kind = service.Namespace, service.Name, "Service"
+				case viewNetworkPolicies:
+					policy := m.netpols[m.cursor]
+					namespace, name, kind = policy.Namespace, policy.Name, "NetworkPolicy"
+				case viewNamespaces:
+					ns := m.namespaces[m.cursor]
+					namespace, name, kind = "", ns.Name, "Namespace"
+				}
+				if kind != "" {
+					m.setView(viewYAML)
+					return m, getResourceYAML(m.clientset, namespace, name, kind)
+				}
+			}
+		case "S":
+			if m.view == viewDetails && m.previousView == viewDeployments {
+				m.textInput.SetValue("")
+				m.textInput.Focus()
+				m.setView(viewScaling)
+			}
 		case "q", "ctrl+c":
 			if m.view != viewResourceMenu {
 				m.setView(viewResourceMenu)
@@ -1014,6 +1070,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setView(m.previousView)
 		case "enter":
 			switch m.view {
+			case viewPods, viewDeployments, viewNodes, viewPVCs, viewPVs, viewStatefulSets, viewDaemonSets, viewServices, viewNetworkPolicies, viewEvents:
+				m.setView(viewDetails)
 			case viewResourceMenu:
 				selected := m.resourceTypes[m.cursor]
 				switch selected {
@@ -1163,8 +1221,22 @@ func renderHeader(m model) string {
 }
 
 func renderFooter(m model) string {
-	// Example footer content
-	return m.styles.Footer.Render(" (q)uit | (b)ack to menu | (↑/↓) navigate")
+	var help string
+	switch m.view {
+	case viewHostDashboard:
+		help = " (l/h) change tab | (↑/↓) navigate"
+	case viewDetails:
+		switch m.previousView {
+		case viewPods:
+			help = " (L)ogs | (X)delete | (Y)AML"
+		case viewDeployments:
+			help = " (S)cale Replicas"
+		}
+	default:
+		help = " (q)uit | (b)ack to menu | (↑/↓) navigate"
+	}
+
+	return m.styles.Footer.Render(help)
 }
 func renderHelp() string {
 	return `

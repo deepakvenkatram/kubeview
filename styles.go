@@ -33,25 +33,26 @@ func DefaultStyles() Styles {
 
 	s.HeaderText = lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#FAFAFA"))
+		Foreground(lipgloss.Color("#FFD700")) // Gold
 
 	s.Header = lipgloss.NewStyle().
 		Padding(0, 1).
 		BorderBottom(true).
-		BorderForeground(lipgloss.Color("240"))
+		BorderForeground(lipgloss.Color("#5C5CFF")) // Brighter Blue
 
 	s.Footer = s.Header.Copy()
 
 	s.TableHeader = lipgloss.NewStyle().
 		Bold(true).
-		Padding(0, 1)
+		Padding(0, 1).
+		Foreground(lipgloss.Color("#00BFFF")) // DeepSkyBlue
 
 	s.Row = lipgloss.NewStyle().
 		Padding(0, 1)
 
 	s.SelectedItem = s.Row.Copy().
-		Background(lipgloss.Color("240")).
-		Foreground(lipgloss.Color("#FAFAFA"))
+		Background(lipgloss.Color("#005FFF")). // Darker Blue
+		Foreground(lipgloss.Color("#FFFFFF"))   // White
 
 	s.Success = lipgloss.NewStyle().
 		Foreground(lipgloss.Color("35")) // Green
@@ -66,10 +67,10 @@ func DefaultStyles() Styles {
 		Foreground(lipgloss.Color("240"))
 
 	s.ChartBar = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#00BFFF")) // DeepSkyBlue
+		Foreground(lipgloss.Color("#32CD32")) // Lime Green
 
 	s.ChartText = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("248"))
+		Foreground(lipgloss.Color("#FFFFFF"))
 
 	s.Title = lipgloss.NewStyle().
 		Bold(true).
@@ -80,7 +81,8 @@ func DefaultStyles() Styles {
 
 	s.ChartTitle = lipgloss.NewStyle().
 		Bold(true).
-		Padding(0, 1)
+		Padding(0, 1).
+		Foreground(lipgloss.Color("#FFD700")) // Gold
 
 	s.Tab = lipgloss.NewStyle().
 		Padding(0, 2).
@@ -89,9 +91,9 @@ func DefaultStyles() Styles {
 		BorderForeground(lipgloss.Color("240"))
 
 	s.ActiveTab = s.Tab.Copy().
-		Foreground(lipgloss.Color("#FAFAFA")).
-		Background(lipgloss.Color("#00BFFF")).
-		BorderForeground(lipgloss.Color("#00BFFF"))
+		Foreground(lipgloss.Color("#FFFFFF")).
+		Background(lipgloss.Color("#005FFF")). // Darker Blue
+		BorderForeground(lipgloss.Color("#005FFF"))
 
 	return s
 }
