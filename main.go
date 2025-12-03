@@ -7,16 +7,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NimbleMarkets/ntcharts/barchart"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/mem"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -24,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -55,7 +62,21 @@ const (
 	viewDashboard // New view state for Dashboard
 	viewResourceMenu
 	viewHelp
+	viewHostDashboard
+	viewHostLogs
+	viewAppLogs
+	viewDeploymentPods
+	viewEditYAML
 )
+
+type resourceUpdatedMsg struct{}
+type diskUsageStat struct {
+	Mountpoint  string
+	Total       uint64
+	Used        uint64
+	Free        uint64
+	UsedPercent float64
+}
 
 type model struct {
 	view               viewState
@@ -74,6 +95,7 @@ type model struct {
 	events             []v1.Event
 	namespaces         []v1.Namespace
 	resourceTypes      []string
+	hostLogTypes       []string
 	selectedNamespace  string // "" == all
 	details            string
 	yamlContent        string    // New field for YAML content
@@ -83,20 +105,42 @@ type model struct {
 	topPodsByMemory    []v1.Pod  // Top pods by Memory usage
 	topNodesByCPU      []v1.Node // Top nodes by CPU usage
 	topNodesByMemory   []v1.Node // Top nodes by Memory usage
+	podCPUChart        barchart.Model
+	podMemoryChart     barchart.Model
+	nodeCPUChart       barchart.Model
+	nodeMemoryChart    barchart.Model
 	cursor             int
 	err                error
 	clientset          *kubernetes.Clientset
 	metricsClientset   *metrics.Clientset
 	styles             Styles
 	viewport           viewport.Model
+	textarea           textarea.Model
 	textInput          textinput.Model
+	hostTabs           []string
+	activeHostTab      int
+	hostCPUChart       barchart.Model
+	hostMemoryChart    barchart.Model
+	hostDiskUsage      []diskUsageStat
+	containers         []string
+	deploymentPods     []v1.Pod
 	ready              bool
 }
 
+type deploymentPodsMsg struct{ pods []v1.Pod }
 type tickMsg time.Time
+type hostMsg struct {
+	cpuUsage    float64
+	memoryUsage float64
+	diskUsage   []diskUsageStat
+}
+type appLogsMsg struct{ containers []string }
+type containerLogsMsg struct{ logs string }
+type hostLogsMsg struct{ logs string }
 type logsMsg struct{ logs string }
 type scaleMsg struct{}
 type podDeletedMsg struct{}
+type deploymentDeletedMsg struct{}
 type nodesMsg struct {
 	nodes   []v1.Node
 	metrics map[string]v1beta1.NodeMetrics
@@ -117,12 +161,27 @@ type namespacesMsg struct{ namespaces []v1.Namespace }
 type errMsg struct{ err error }
 type yamlMsg struct{ yaml string } // New message type
 type dashboardMsg struct {
-	clusterCPUUsage    string
-	clusterMemoryUsage string
-	topPodsByCPU       []v1.Pod
-	topPodsByMemory    []v1.Pod
-	topNodesByCPU      []v1.Node
-	topNodesByMemory   []v1.Node
+	clusterCPUUsage     string
+	clusterMemoryUsage  string
+	topPodsByCPU        []v1.Pod
+	topPodsByMemory     []v1.Pod
+	topNodesByCPU       []v1.Node
+	topNodesByMemory    []v1.Node
+	podCPUChartData     []barchart.BarData
+	podMemoryChartData  []barchart.BarData
+	nodeCPUChartData    []barchart.BarData
+	nodeMemoryChartData []barchart.BarData
+}
+
+func (m *model) setView(view viewState) {
+	m.previousView = m.view
+	m.view = view
+}
+
+func (m *model) setListView(view viewState) {
+	m.previousView = m.view
+	m.view = view
+	m.cursor = 0
 }
 
 func (e errMsg) Error() string { return e.err.Error() }
@@ -143,6 +202,63 @@ func deletePod(clientset *kubernetes.Clientset, namespace, name string) tea.Cmd 
 	}
 }
 
+func getPodsForDeployment(clientset *kubernetes.Clientset, deployment appsv1.Deployment) tea.Cmd {
+	return func() tea.Msg {
+		selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+		if err != nil {
+			return errMsg{err}
+		}
+		listOptions := metav1.ListOptions{LabelSelector: selector.String()}
+		pods, err := clientset.CoreV1().Pods(deployment.Namespace).List(context.Background(), listOptions)
+		if err != nil {
+			return errMsg{err}
+		}
+		return deploymentPodsMsg{pods: pods.Items}
+	}
+}
+
+func deleteDeployment(clientset *kubernetes.Clientset, namespace, name string) tea.Cmd {
+	return func() tea.Msg {
+		err := clientset.AppsV1().Deployments(namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+		if err != nil {
+			return errMsg{err}
+		}
+		return deploymentDeletedMsg{}
+	}
+}
+
+func applyYAML(clientset *kubernetes.Clientset, namespace, yamlContent string) tea.Cmd {
+	return func() tea.Msg {
+		decoder := utilyaml.NewYAMLToJSONDecoder(strings.NewReader(yamlContent))
+		var rawObj runtime.RawExtension
+		err := decoder.Decode(&rawObj)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		obj, gvk, err := scheme.Codecs.UniversalDeserializer().Decode(rawObj.Raw, nil, nil)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		switch gvk.Kind {
+		case "Pod":
+			pod := obj.(*v1.Pod)
+			_, err = clientset.CoreV1().Pods(pod.Namespace).Update(context.Background(), pod, metav1.UpdateOptions{})
+		case "Deployment":
+			deployment := obj.(*appsv1.Deployment)
+			_, err = clientset.AppsV1().Deployments(deployment.Namespace).Update(context.Background(), deployment, metav1.UpdateOptions{})
+		default:
+			return errMsg{fmt.Errorf("unsupported kind for apply: %s", gvk.Kind)}
+		}
+
+		if err != nil {
+			return errMsg{err}
+		}
+		return resourceUpdatedMsg{}
+	}
+}
+
 func scaleDeployment(clientset *kubernetes.Clientset, namespace, name string, replicas int32) tea.Cmd {
 	return func() tea.Msg {
 		deployment, err := clientset.AppsV1().Deployments(namespace).Get(context.Background(), name, metav1.GetOptions{})
@@ -156,6 +272,48 @@ func scaleDeployment(clientset *kubernetes.Clientset, namespace, name string, re
 			return errMsg{err}
 		}
 		return scaleMsg{}
+	}
+}
+
+func getHostMetrics() tea.Cmd {
+	return func() tea.Msg {
+		cpuPercentages, err := cpu.Percent(time.Second, false)
+		if err != nil {
+			return errMsg{err}
+		}
+		cpuUsage := cpuPercentages[0]
+
+		memInfo, err := mem.VirtualMemory()
+		if err != nil {
+			return errMsg{err}
+		}
+		memUsage := memInfo.UsedPercent
+
+		partitions, err := disk.Partitions(true)
+		if err != nil {
+			return errMsg{err}
+		}
+
+		var diskUsage []diskUsageStat
+		for _, p := range partitions {
+			usage, err := disk.Usage(p.Mountpoint)
+			if err != nil {
+				continue // Or handle error
+			}
+			diskUsage = append(diskUsage, diskUsageStat{
+				Mountpoint:  p.Mountpoint,
+				Total:       usage.Total,
+				Used:        usage.Used,
+				Free:        usage.Free,
+				UsedPercent: usage.UsedPercent,
+			})
+		}
+
+		return hostMsg{
+			cpuUsage:    cpuUsage,
+			memoryUsage: memUsage,
+			diskUsage:   diskUsage,
+		}
 	}
 }
 
@@ -178,6 +336,63 @@ func getLogs(clientset *kubernetes.Clientset, namespace, podName string) tea.Cmd
 	}
 }
 
+func getHostLogs(logType string) tea.Cmd {
+	return func() tea.Msg {
+		var args []string
+		cmd := ""
+		switch logType {
+		case "System Logs":
+			cmd = "journalctl"
+		case "Kubelet Logs":
+			cmd = "journalctl"
+			args = []string{"-u", "kubelet.service"}
+		case "Docker Logs":
+			cmd = "journalctl"
+			args = []string{"-u", "docker.service"}
+		case "dmesg":
+			cmd = "dmesg"
+		default:
+			return errMsg{fmt.Errorf("unknown log type: %s", logType)}
+		}
+
+		c := exec.Command(cmd, args...)
+		var out bytes.Buffer
+		c.Stdout = &out
+		err := c.Run()
+		if err != nil {
+			return errMsg{err}
+		}
+		return hostLogsMsg{logs: out.String()}
+	}
+}
+
+func getContainers() tea.Cmd {
+	return func() tea.Msg {
+		cmd := "docker ps --format '{{.Names}}'"
+		c := exec.Command("bash", "-c", cmd)
+		var out bytes.Buffer
+		c.Stdout = &out
+		err := c.Run()
+		if err != nil {
+			return errMsg{err}
+		}
+		containers := strings.Split(strings.TrimSpace(out.String()), "\n")
+		return appLogsMsg{containers: containers}
+	}
+}
+
+func getContainerLogs(containerName string) tea.Cmd {
+	return func() tea.Msg {
+		c := exec.Command("docker", "logs", containerName)
+		var out bytes.Buffer
+		c.Stdout = &out
+		err := c.Run()
+		if err != nil {
+			return errMsg{err}
+		}
+		return containerLogsMsg{logs: out.String()}
+	}
+}
 func getNodes(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) tea.Cmd {
 	return func() tea.Msg {
 		nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
@@ -354,7 +569,7 @@ func getResourceYAML(clientset *kubernetes.Clientset, namespace, name, kind stri
 }
 
 // getDashboardMetrics fetches and aggregates cluster-wide resource utilization metrics.
-func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) tea.Cmd {
+func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset, styles Styles) tea.Cmd {
 	return func() tea.Msg {
 		var totalCPUCapacity, totalMemoryCapacity resource.Quantity
 		var totalCPUUsage, totalMemoryUsage resource.Quantity
@@ -477,6 +692,28 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topNodesMem = append(topNodesMem, nodesByMemory[i].Node)
 		}
 
+		var podCPUData []barchart.BarData
+		for _, p := range topPodsCPU {
+			podCPUData = append(podCPUData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodCPU(podMetricsMap[p.Name]).MilliValue()), Style: styles.ChartBar}}})
+		}
+
+		var podMemoryData []barchart.BarData
+		for _, p := range topPodsMem {
+			podMemoryData = append(podMemoryData, barchart.BarData{Label: p.Name, Values: []barchart.BarValue{{Value: float64(totalPodMemory(podMetricsMap[p.Name]).Value() / (1024 * 1024)), Style: styles.ChartBar}}})
+		}
+
+		var nodeCPUData []barchart.BarData
+		for _, n := range topNodesCPU {
+			cpu := nodeMetricsMap[n.Name].Usage[v1.ResourceCPU]
+			nodeCPUData = append(nodeCPUData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64((&cpu).MilliValue()), Style: styles.ChartBar}}})
+		}
+
+		var nodeMemoryData []barchart.BarData
+		for _, n := range topNodesMem {
+			mem := nodeMetricsMap[n.Name].Usage[v1.ResourceMemory]
+			nodeMemoryData = append(nodeMemoryData, barchart.BarData{Label: n.Name, Values: []barchart.BarValue{{Value: float64((&mem).Value() / (1024 * 1024)), Style: styles.ChartBar}}})
+		}
+
 		return dashboardMsg{
 			clusterCPUUsage:    fmt.Sprintf("%s / %s (%s%%)", formatMilliCPU(&totalCPUUsage), formatMilliCPU(&totalCPUCapacity), formatPercentage(totalCPUUsage.MilliValue(), totalCPUCapacity.MilliValue())),
 			clusterMemoryUsage: fmt.Sprintf("%s / %s (%s%%)", formatMiBMemory(&totalMemoryUsage), formatMiBMemory(&totalMemoryCapacity), formatPercentage(totalMemoryUsage.Value(), totalMemoryCapacity.Value())),
@@ -484,34 +721,40 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 			topPodsByMemory:    topPodsMem,
 			topNodesByCPU:      topNodesCPU,
 			topNodesByMemory:   topNodesMem,
+			podCPUChartData:    podCPUData,
+			podMemoryChartData: podMemoryData,
+			nodeCPUChartData:   nodeCPUData,
+			nodeMemoryChartData: nodeMemoryData,
 		}
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(getNodes(m.clientset, m.metricsClientset), doTick())
+	return tea.Batch(
+		doTick(),
+		getDashboardMetrics(m.clientset, m.metricsClientset, m.styles), // Fetch dashboard metrics on init
+		getHostMetrics(), // Fetch host metrics on init
+	)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		cmd  tea.Cmd
-		cmds []tea.Cmd
-	)
+	var cmd tea.Cmd
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		headerHeight := lipgloss.Height(m.headerView())
-		footerHeight := lipgloss.Height(m.footerView())
-		verticalMarginHeight := headerHeight + footerHeight
-
-		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-verticalMarginHeight)
-			m.viewport.YPosition = headerHeight
-			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - verticalMarginHeight
-		}
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 10 // Adjust for header/footer
+		chartWidth := msg.Width / 2
+		chartHeight := msg.Height / 3
+		m.podCPUChart = barchart.New(chartWidth, chartHeight)
+		m.podMemoryChart = barchart.New(chartWidth, chartHeight)
+		m.nodeCPUChart = barchart.New(chartWidth, chartHeight)
+		m.nodeMemoryChart = barchart.New(chartWidth, chartHeight)
+		m.hostCPUChart = barchart.New(chartWidth, chartHeight)
+		m.hostMemoryChart = barchart.New(chartWidth, chartHeight)
+		m.ready = true
+		return m, nil
 	case tickMsg:
 		switch m.view {
 		case viewNodes:
@@ -534,1207 +777,1172 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
 		case viewEvents:
 			return m, getEvents(m.clientset, m.selectedNamespace)
+		case viewNamespaces:
+			return m, getNamespaces(m.clientset)
 		case viewDashboard:
-			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+			return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
+		case viewHostDashboard:
+			return m, getHostMetrics()
+
 		}
 		return m, doTick()
-	case logsMsg:
-		m.viewport.SetContent(msg.logs)
-		m.view = viewLogs
-		return m, nil
-	case scaleMsg:
-		m.view = viewDetails
-		return m, getDeployments(m.clientset, m.selectedNamespace)
-	case podDeletedMsg:
-		m.view = viewPods
-		return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
-	case namespacesMsg:
-		m.namespaces = msg.namespaces
-		m.cursor = 0
-		return m, nil
 	case nodesMsg:
 		m.nodes = msg.nodes
 		m.nodeMetrics = msg.metrics
-		if m.cursor >= len(m.nodes) {
-			m.cursor = 0
-		}
-		return m, doTick()
+		return m, nil
 	case podsMsg:
 		m.pods = msg.pods
 		m.podMetrics = msg.metrics
-		if m.cursor >= len(m.pods) {
-			m.cursor = 0
-		}
-		return m, doTick()
+		return m, nil
 	case pvcsMsg:
 		m.pvcs = msg.pvcs
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case pvsMsg:
 		m.pvs = msg.pvs
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case deploymentsMsg:
 		m.deployments = msg.deployments
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case statefulsetsMsg:
 		m.statefulsets = msg.statefulsets
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case daemonsetsMsg:
 		m.daemonsets = msg.daemonsets
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case servicesMsg:
 		m.services = msg.services
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case networkPoliciesMsg:
 		m.netpols = msg.policies
-		m.cursor = 0
-		return m, doTick()
+		return m, nil
 	case eventsMsg:
 		m.events = msg.events
-		m.cursor = 0
-		return m, doTick()
-	case errMsg:
-		m.err = msg
-		return m, nil // Don't quit, just store the error and let the View function display it
-	case yamlMsg: // New case
-		m.yamlContent = msg.yaml
-		m.view = viewYAML
 		return m, nil
-	case dashboardMsg: // New case for dashboard metrics
+	case namespacesMsg:
+		m.namespaces = msg.namespaces
+		return m, nil
+	case logsMsg:
+		m.details = msg.logs
+		m.viewport.SetContent(m.details)
+		m.viewport.GotoTop() // Scroll to top
+		return m, nil
+	case hostMsg:
+		cpuBarData := barchart.BarData{
+			Values: []barchart.BarValue{{Value: msg.cpuUsage, Style: m.styles.ChartBar}},
+		}
+		memBarData := barchart.BarData{
+			Values: []barchart.BarValue{{Value: msg.memoryUsage, Style: m.styles.ChartBar}},
+		}
+		m.hostCPUChart.Push(cpuBarData)
+		m.hostMemoryChart.Push(memBarData)
+		m.hostDiskUsage = msg.diskUsage
+		return m, nil
+	case appLogsMsg:
+		m.containers = msg.containers
+		return m, nil
+	case hostLogsMsg:
+		m.details = msg.logs
+		m.viewport.SetContent(m.details)
+		m.viewport.GotoTop()
+		return m, nil
+
+	case containerLogsMsg:
+		m.details = msg.logs
+		m.viewport.SetContent(m.details)
+		m.viewport.GotoTop()
+		return m, nil
+	case yamlMsg:
+		m.yamlContent = msg.yaml
+		m.viewport.SetContent(m.yamlContent)
+		m.viewport.GotoTop()
+		return m, nil
+	case dashboardMsg:
 		m.clusterCPUUsage = msg.clusterCPUUsage
 		m.clusterMemoryUsage = msg.clusterMemoryUsage
 		m.topPodsByCPU = msg.topPodsByCPU
 		m.topPodsByMemory = msg.topPodsByMemory
 		m.topNodesByCPU = msg.topNodesByCPU
 		m.topNodesByMemory = msg.topNodesByMemory
-		return m, doTick()
+		m.podCPUChart.PushAll(msg.podCPUChartData)
+		m.podMemoryChart.PushAll(msg.podMemoryChartData)
+		m.nodeCPUChart.PushAll(msg.nodeCPUChartData)
+		m.nodeMemoryChart.PushAll(msg.nodeMemoryChartData)
+		return m, nil
+	case deploymentPodsMsg:
+		m.deploymentPods = msg.pods
+		m.setListView(viewDeploymentPods)
+		return m, nil
+	case scaleMsg:
+		m.setListView(m.previousView) // Go back to the previous view
+		// Trigger a refresh of the view
+		switch m.view {
+		case viewDeployments:
+			return m, getDeployments(m.clientset, m.selectedNamespace)
+		}
+		return m, nil
+	case podDeletedMsg:
+		m.setListView(viewPods) // Go back to the previous view
+		return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
+	case deploymentDeletedMsg:
+		m.setListView(viewDeployments)
+		return m, getDeployments(m.clientset, m.selectedNamespace)
+	case resourceUpdatedMsg:
+		m.setView(m.previousView) // Go back to details
+		// Could add a cmd to re-fetch the resource details here
+		return m, nil
+	case errMsg:
+		m.err = msg.err
+		return m, nil
 	case tea.KeyMsg:
-		if m.view == viewConfirmDelete {
+		if m.view == viewEditYAML {
 			switch msg.String() {
-			case "y", "Y":
-				pod := m.pods[m.cursor]
-				return m, deletePod(m.clientset, pod.Namespace, pod.Name)
-			case "n", "N", "esc":
-				m.view = viewDetails
+			case "ctrl+s":
+				return m, applyYAML(m.clientset, m.selectedNamespace, m.textarea.Value())
+			case "esc":
+				m.setView(m.previousView)
+				return m, nil
 			}
-			return m, nil
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			return m, cmd
 		}
 		if m.view == viewScaling {
 			switch msg.String() {
 			case "enter":
-				replicaCount, err := strconv.Atoi(m.textInput.Value())
+				replicas, err := strconv.Atoi(m.textInput.Value())
 				if err == nil {
-					d := m.deployments[m.cursor]
-					return m, scaleDeployment(m.clientset, d.Namespace, d.Name, int32(replicaCount))
+					var deployment appsv1.Deployment
+					if m.previousView == viewDeployments {
+						deployment = m.deployments[m.cursor]
+					}
+					return m, scaleDeployment(m.clientset, deployment.Namespace, deployment.Name, int32(replicas))
 				}
-			case "esc":
-				m.view = viewDetails
-				m.textInput.Reset()
-			default:
-				m.textInput, cmd = m.textInput.Update(msg)
-				cmds = append(cmds, cmd)
+			case "q", "esc":
+				m.setView(m.previousView)
+				return m, nil
 			}
-			return m, tea.Batch(cmds...)
+			m.textInput, cmd = m.textInput.Update(msg)
+			return m, cmd
 		}
-		if m.view == viewLogs {
+		if m.view == viewConfirmDelete {
 			switch msg.String() {
-			case "esc", "backspace", "q":
-				m.view = viewDetails
-			default:
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-			return m, tea.Batch(cmds...)
-		}
-		if m.view == viewYAML { // New view for YAML
-			switch msg.String() {
-			case "esc", "backspace", "q":
-				m.view = viewDetails
-			default:
-				m.viewport, cmd = m.viewport.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-			return m, tea.Batch(cmds...)
-		}
-		if m.view == viewDetails {
-			switch msg.String() {
-			case "d":
-				if m.previousView == viewPods {
-					m.view = viewConfirmDelete
-					return m, nil
-				}
-			case "r":
-				if m.previousView == viewDeployments {
-					m.view = viewScaling
-					m.textInput.Focus()
-					m.textInput.SetValue(fmt.Sprintf("%d", *m.deployments[m.cursor].Spec.Replicas))
-					return m, nil
-				}
-			case "l":
-				if m.previousView == viewPods {
-					pod := m.pods[m.cursor]
-					return m, getLogs(m.clientset, pod.Namespace, pod.Name)
-				}
-			case "y": // New keybinding for YAML
-				var name, namespace, kind string
+			case "y", "Y":
 				switch m.previousView {
-				case viewNodes:
-					name = m.nodes[m.cursor].Name
-					kind = "Node"
-				case viewPods:
-					name = m.pods[m.cursor].Name
-					namespace = m.pods[m.cursor].Namespace
-					kind = "Pod"
-				case viewPVCs:
-					name = m.pvcs[m.cursor].Name
-					namespace = m.pvcs[m.cursor].Namespace
-					kind = "PersistentVolumeClaim"
-				case viewPVs:
-					name = m.pvs[m.cursor].Name
-					kind = "PersistentVolume"
+				case viewPods, viewDetails: // Can come from details view too
+					// Need to check if the details view's previous was pods
+					if m.previousView == viewDetails && m.pods[m.cursor].Name != "" {
+						pod := m.pods[m.cursor]
+						return m, deletePod(m.clientset, pod.Namespace, pod.Name)
+					}
+					pod := m.pods[m.cursor]
+					return m, deletePod(m.clientset, pod.Namespace, pod.Name)
 				case viewDeployments:
-					name = m.deployments[m.cursor].Name
-					namespace = m.deployments[m.cursor].Namespace
-					kind = "Deployment"
-				case viewStatefulSets:
-					name = m.statefulsets[m.cursor].Name
-					namespace = m.statefulsets[m.cursor].Namespace
-					kind = "StatefulSet"
-				case viewDaemonSets:
-					name = m.daemonsets[m.cursor].Name
-					namespace = m.daemonsets[m.cursor].Namespace
-					kind = "DaemonSet"
-				case viewServices:
-					name = m.services[m.cursor].Name
-					namespace = m.services[m.cursor].Namespace
-					kind = "Service"
-				case viewNetworkPolicies:
-					name = m.netpols[m.cursor].Name
-					namespace = m.netpols[m.cursor].Namespace
-					kind = "NetworkPolicy"
-				case viewEvents:
-					name = m.events[m.cursor].Name
-					namespace = m.events[m.cursor].Namespace
-					kind = "Event"
-				case viewNamespaces:
-					// Namespaces don't have a specific YAML view in this context,
-					// or it's less common to view their YAML directly from a list.
-					// For now, we can skip or add later if needed.
-					return m, nil
-				default:
-					return m, nil
+					deployment := m.deployments[m.cursor]
+					return m, deleteDeployment(m.clientset, deployment.Namespace, deployment.Name)
 				}
-				return m, getResourceYAML(m.clientset, namespace, name, kind)
-			case "esc", "backspace":
-				m.view = m.previousView
-			}
-			return m, nil
-		}
-		if m.view == viewHelp {
-			switch msg.String() {
-			case "esc", "backspace", "q", "?":
-				m.view = m.previousView
-			}
-			return m, nil
-		}
-		if m.view == viewNamespaces {
-			switch msg.String() {
-			case "enter":
-				if m.cursor == 0 {
-					m.selectedNamespace = "" // All namespaces
-				} else {
-					m.selectedNamespace = m.namespaces[m.cursor-1].Name
-				}
-				m.view = m.previousView
-				updatedModel, cmd := m.Update(tickMsg{})
-				return updatedModel, cmd
-			case "esc", "backspace", "N":
-				m.view = m.previousView
-			case "up":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-			case "down":
-				if m.cursor < len(m.namespaces) {
-					m.cursor++
-				}
-			}
-			return m, nil
-		}
-		if m.view == viewResourceMenu {
-			switch msg.String() {
-			case "enter":
-				selectedResource := m.resourceTypes[m.cursor]
-				switch selectedResource {
-				case "Nodes":
-					m.view = viewNodes
-					return m, getNodes(m.clientset, m.metricsClientset)
-				case "Pods":
-					m.view = viewPods
-					return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
-				case "Deployments":
-					m.view = viewDeployments
-					return m, getDeployments(m.clientset, m.selectedNamespace)
-				case "StatefulSets":
-					m.view = viewStatefulSets
-					return m, getStatefulSets(m.clientset, m.selectedNamespace)
-				case "DaemonSets":
-					m.view = viewDaemonSets
-					return m, getDaemonSets(m.clientset, m.selectedNamespace)
-				case "Services":
-					m.view = viewServices
-					return m, getServices(m.clientset, m.selectedNamespace)
-				case "PVCs":
-					m.view = viewPVCs
-					return m, getPVCs(m.clientset, m.selectedNamespace)
-				case "PVs":
-					m.view = viewPVs
-					return m, getPVs(m.clientset)
-				case "Network Policies":
-					m.view = viewNetworkPolicies
-					return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
-				case "Events":
-					m.view = viewEvents
-					return m, getEvents(m.clientset, m.selectedNamespace)
-				}
-			case "esc", "backspace", "r":
-				m.view = m.previousView
-			case "up":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-			case "down":
-				if m.cursor < len(m.resourceTypes)-1 {
-					m.cursor++
-				}
+			case "n", "N", "q", "esc":
+				m.setView(m.previousView)
+				return m, nil
 			}
 			return m, nil
 		}
 
 		switch msg.String() {
-		case "?":
-			m.previousView = m.view
-			m.view = viewHelp
-			return m, nil
 		case "q", "ctrl+c":
+			if m.view != viewResourceMenu {
+				m.setListView(viewResourceMenu)
+				return m, nil
+			}
 			return m, tea.Quit
-		case "r":
-			m.previousView = m.view
-			m.view = viewResourceMenu
-			m.cursor = 0 // Reset cursor for the new menu
-			return m, nil
-		case "N":
-			m.previousView = m.view
-			m.view = viewNamespaces
-			return m, getNamespaces(m.clientset)
-		case "D": // New keybinding for Dashboard
-			m.previousView = m.view
-			m.view = viewDashboard
-			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
-		case "up":
+		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
 		case "down", "j":
-			listLen := 0
+			switch m.view {
+			case viewResourceMenu:
+				if m.cursor < len(m.resourceTypes)-1 {
+					m.cursor++
+				}
+			case viewNodes:
+				if m.cursor < len(m.nodes)-1 {
+					m.cursor++
+				}
+			case viewPods:
+				if m.cursor < len(m.pods)-1 {
+					m.cursor++
+				}
+			case viewPVCs:
+				if m.cursor < len(m.pvcs)-1 {
+					m.cursor++
+				}
+			case viewPVs:
+				if m.cursor < len(m.pvs)-1 {
+					m.cursor++
+				}
+			case viewDeployments:
+				if m.cursor < len(m.deployments)-1 {
+					m.cursor++
+				}
+			case viewStatefulSets:
+				if m.cursor < len(m.statefulsets)-1 {
+					m.cursor++
+				}
+			case viewDaemonSets:
+				if m.cursor < len(m.daemonsets)-1 {
+					m.cursor++
+				}
+			case viewServices:
+				if m.cursor < len(m.services)-1 {
+					m.cursor++
+				}
+			case viewNetworkPolicies:
+				if m.cursor < len(m.netpols)-1 {
+					m.cursor++
+				}
+			case viewEvents:
+				if m.cursor < len(m.events)-1 {
+					m.cursor++
+				}
+			case viewNamespaces:
+				if m.cursor < len(m.namespaces)-1 {
+					m.cursor++
+				}
+			case viewHostDashboard:
+				switch m.hostTabs[m.activeHostTab] {
+				case "System Logs":
+					if m.cursor < len(m.hostLogTypes)-1 {
+						m.cursor++
+					}
+				case "Application Logs":
+					if m.cursor < len(m.containers)-1 {
+						m.cursor++
+					}
+				}
+			}
+		case "right", "l":
+			if m.view == viewHostDashboard {
+				m.activeHostTab = (m.activeHostTab + 1) % len(m.hostTabs)
+				m.details = ""
+				m.viewport.SetContent("")
+				m.cursor = 0
+				if m.hostTabs[m.activeHostTab] == "Application Logs" {
+					return m, getContainers()
+				}
+			}
+		case "left", "h":
+			if m.view == viewHostDashboard {
+				m.activeHostTab = (m.activeHostTab - 1 + len(m.hostTabs)) % len(m.hostTabs)
+			}
+		case "d": // Details or Describe
 			switch m.view {
 			case viewNodes:
-				listLen = len(m.nodes)
+				m.details = formatNodeDetails(m.nodes[m.cursor])
 			case viewPods:
-				listLen = len(m.pods)
+				m.details = formatPodDetails(m.pods[m.cursor])
 			case viewPVCs:
-				listLen = len(m.pvcs)
+				m.details = formatPVCDetails(m.pvcs[m.cursor])
 			case viewPVs:
-				listLen = len(m.pvs)
+				m.details = formatPVDetails(m.pvs[m.cursor])
 			case viewDeployments:
-				listLen = len(m.deployments)
+				m.details = formatDeploymentDetails(m.deployments[m.cursor])
 			case viewStatefulSets:
-				listLen = len(m.statefulsets)
+				m.details = formatStatefulSetDetails(m.statefulsets[m.cursor])
 			case viewDaemonSets:
-				listLen = len(m.daemonsets)
+				m.details = formatDaemonSetDetails(m.daemonsets[m.cursor])
 			case viewServices:
-				listLen = len(m.services)
+				m.details = formatServiceDetails(m.services[m.cursor])
 			case viewNetworkPolicies:
-				listLen = len(m.netpols)
+				m.details = formatNetworkPolicyDetails(m.netpols[m.cursor])
 			case viewEvents:
-				listLen = len(m.events)
+				m.details = formatEventDetails(m.events[m.cursor])
 			}
-			if m.cursor < listLen-1 {
-				m.cursor++
+			m.setView(viewDetails)
+		case "y": // View YAML
+			var namespace, name, kind string
+			viewToCheck := m.view
+			if m.view == viewDetails {
+				viewToCheck = m.previousView
 			}
-		case "enter":
-			m.previousView = m.view
-			m.view = viewDetails
-			switch m.previousView {
+			switch viewToCheck {
 			case viewNodes:
 				node := m.nodes[m.cursor]
-				metrics, hasMetrics := m.nodeMetrics[node.Name]
-				m.details = m.formatNodeDetails(node, metrics, hasMetrics)
+				namespace, name, kind = "", node.Name, "Node"
 			case viewPods:
 				pod := m.pods[m.cursor]
-				metrics, hasMetrics := m.podMetrics[pod.Name]
-				m.details = m.formatPodDetails(pod, metrics, hasMetrics)
+				namespace, name, kind = pod.Namespace, pod.Name, "Pod"
 			case viewPVCs:
-				m.details = m.formatPVCDetails(m.pvcs[m.cursor])
+				pvc := m.pvcs[m.cursor]
+				namespace, name, kind = pvc.Namespace, pvc.Name, "PersistentVolumeClaim"
 			case viewPVs:
-				m.details = m.formatPVDetails(m.pvs[m.cursor])
+				pv := m.pvs[m.cursor]
+				namespace, name, kind = "", pv.Name, "PersistentVolume"
 			case viewDeployments:
-				m.details = m.formatDeploymentDetails(m.deployments[m.cursor])
+				deployment := m.deployments[m.cursor]
+				namespace, name, kind = deployment.Namespace, deployment.Name, "Deployment"
 			case viewStatefulSets:
-				m.details = m.formatStatefulSetDetails(m.statefulsets[m.cursor])
+				statefulset := m.statefulsets[m.cursor]
+				namespace, name, kind = statefulset.Namespace, statefulset.Name, "StatefulSet"
 			case viewDaemonSets:
-				m.details = m.formatDaemonSetDetails(m.daemonsets[m.cursor])
+				daemonset := m.daemonsets[m.cursor]
+				namespace, name, kind = daemonset.Namespace, daemonset.Name, "DaemonSet"
 			case viewServices:
-				m.details = m.formatServiceDetails(m.services[m.cursor])
+				service := m.services[m.cursor]
+				namespace, name, kind = service.Namespace, service.Name, "Service"
 			case viewNetworkPolicies:
-				m.details = m.formatNetworkPolicyDetails(m.netpols[m.cursor])
-			case viewEvents:
-				m.details = m.formatEventDetails(m.events[m.cursor])
+				policy := m.netpols[m.cursor]
+				namespace, name, kind = policy.Namespace, policy.Name, "NetworkPolicy"
+			case viewNamespaces:
+				ns := m.namespaces[m.cursor]
+				namespace, name, kind = "", ns.Name, "Namespace"
 			}
-			return m, nil
+			if kind != "" {
+				m.setView(viewYAML)
+				return m, getResourceYAML(m.clientset, namespace, name, kind)
+			}
+		case "L": // View Logs
+			if m.view == viewPods || (m.view == viewDetails && m.previousView == viewPods) {
+				pod := m.pods[m.cursor]
+				m.setView(viewLogs)
+				return m, getLogs(m.clientset, pod.Namespace, pod.Name)
+			} else if m.view == viewDeployments || (m.view == viewDetails && m.previousView == viewDeployments) {
+				deployment := m.deployments[m.cursor]
+				return m, getPodsForDeployment(m.clientset, deployment)
+			} else if m.view == viewDeploymentPods {
+				pod := m.deploymentPods[m.cursor]
+				m.setView(viewLogs)
+				return m, getLogs(m.clientset, pod.Namespace, pod.Name)
+			}
+		case "S": // Scale
+			if m.view == viewDeployments || (m.view == viewDetails && m.previousView == viewDeployments) {
+				m.textInput.SetValue("")
+				m.textInput.Focus()
+				m.setView(viewScaling)
+			}
+		case "X": // Delete
+			if m.view == viewPods || (m.view == viewDetails && m.previousView == viewPods) {
+				m.setView(viewConfirmDelete)
+			} else if m.view == viewDeployments {
+				m.setView(viewConfirmDelete)
+			}
+		case "E": // Edit
+			if m.view == viewDetails {
+				m.textarea.SetValue(m.yamlContent)
+				m.textarea.Focus()
+				m.setView(viewEditYAML)
+			}
+		case "esc":
+			switch m.view {
+			// From a deep view, go back to the previous view (which should be a list)
+			case viewDetails, viewLogs, viewYAML, viewScaling, viewConfirmDelete:
+				m.setView(m.previousView)
+			// From any list view, go back to the main menu
+			case viewNodes, viewPods, viewDeployments, viewPVCs, viewPVs, viewStatefulSets, viewDaemonSets, viewServices, viewNetworkPolicies, viewEvents, viewNamespaces, viewDashboard, viewHostDashboard:
+				m.setListView(viewResourceMenu)
+			}
+		case "enter":
+			switch m.view {
+			case viewNodes:
+				if len(m.nodes) > m.cursor {
+					m.details = formatNodeDetails(m.nodes[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewPods:
+				if len(m.pods) > m.cursor {
+					m.details = formatPodDetails(m.pods[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewPVCs:
+				if len(m.pvcs) > m.cursor {
+					m.details = formatPVCDetails(m.pvcs[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewPVs:
+				if len(m.pvs) > m.cursor {
+					m.details = formatPVDetails(m.pvs[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewDeployments:
+				if len(m.deployments) > m.cursor {
+					m.details = formatDeploymentDetails(m.deployments[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewStatefulSets:
+				if len(m.statefulsets) > m.cursor {
+					m.details = formatStatefulSetDetails(m.statefulsets[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewDaemonSets:
+				if len(m.daemonsets) > m.cursor {
+					m.details = formatDaemonSetDetails(m.daemonsets[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewServices:
+				if len(m.services) > m.cursor {
+					m.details = formatServiceDetails(m.services[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewNetworkPolicies:
+				if len(m.netpols) > m.cursor {
+					m.details = formatNetworkPolicyDetails(m.netpols[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewEvents:
+				if len(m.events) > m.cursor {
+					m.details = formatEventDetails(m.events[m.cursor])
+					m.viewport.SetContent(m.details)
+					m.setView(viewDetails)
+				}
+			case viewResourceMenu:
+				selected := m.resourceTypes[m.cursor]
+				switch selected {
+				case "Cluster Dashboard":
+					m.setListView(viewDashboard)
+					return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
+				case "Host Dashboard":
+					m.setListView(viewHostDashboard)
+					return m, getHostMetrics()
+				case "Nodes":
+					m.setListView(viewNodes)
+					return m, getNodes(m.clientset, m.metricsClientset)
+				case "Pods":
+					m.setListView(viewPods)
+					return m, getPods(m.clientset, m.metricsClientset, m.selectedNamespace)
+				case "PersistentVolumeClaims":
+					m.setListView(viewPVCs)
+					return m, getPVCs(m.clientset, m.selectedNamespace)
+				case "PersistentVolumes":
+					m.setListView(viewPVs)
+					return m, getPVs(m.clientset)
+				case "Deployments":
+					m.setListView(viewDeployments)
+					return m, getDeployments(m.clientset, m.selectedNamespace)
+				case "StatefulSets":
+					m.setListView(viewStatefulSets)
+					return m, getStatefulSets(m.clientset, m.selectedNamespace)
+				case "DaemonSets":
+					m.setListView(viewDaemonSets)
+					return m, getDaemonSets(m.clientset, m.selectedNamespace)
+				case "Services":
+					m.setListView(viewServices)
+					return m, getServices(m.clientset, m.selectedNamespace)
+				case "NetworkPolicies":
+					m.setListView(viewNetworkPolicies)
+					return m, getNetworkPolicies(m.clientset, m.selectedNamespace)
+				case "Events":
+					m.setListView(viewEvents)
+					return m, getEvents(m.clientset, m.selectedNamespace)
+				case "Namespaces":
+					m.setListView(viewNamespaces)
+					return m, getNamespaces(m.clientset)
+				}
+			case viewNamespaces:
+				if m.cursor == 0 { // "all"
+					m.selectedNamespace = ""
+				} else {
+					m.selectedNamespace = m.namespaces[m.cursor-1].Name
+				}
+				m.setListView(viewResourceMenu)
+			case viewHostDashboard:
+				switch m.hostTabs[m.activeHostTab] {
+				case "System Logs":
+					selectedLogType := m.hostLogTypes[m.cursor]
+					return m, getHostLogs(selectedLogType)
+				case "Application Logs":
+					if len(m.containers) > 0 {
+						selectedContainer := m.containers[m.cursor]
+						return m, getContainerLogs(selectedContainer)
+					}
+				}
+			}
+
+		case "H": // Go to Host Dashboard
+			m.setView(viewHostDashboard)
+			return m, getHostMetrics()
+		case "D": // Go to Cluster Dashboard
+			m.setView(viewDashboard)
+			return m, getDashboardMetrics(m.clientset, m.metricsClientset, m.styles)
 		}
+	}
+	if m.view == viewDetails || m.view == viewLogs || m.view == viewYAML {
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) headerView() string {
-	var title string
-	nsText := "all namespaces"
-	if m.selectedNamespace != "" {
-		nsText = m.selectedNamespace
+func (m model) View() string {
+	if m.err != nil {
+		return fmt.Sprintf("Error: %v", m.err)
 	}
+	if !m.ready {
+		return "Initializing..."
+	}
+
+	s := strings.Builder{}
+	s.WriteString(renderHeader(m))
 
 	switch m.view {
-	case viewNodes:
-		title = "Nodes"
-	case viewPods:
-		title = fmt.Sprintf("Pods in %s", nsText)
-	case viewPVCs:
-		title = fmt.Sprintf("PVCs in %s", nsText)
-	case viewPVs:
-		title = "PersistentVolumes"
-	case viewDeployments:
-		title = fmt.Sprintf("Deployments in %s", nsText)
-	case viewStatefulSets:
-		title = fmt.Sprintf("StatefulSets in %s", nsText)
-	case viewDaemonSets:
-		title = fmt.Sprintf("DaemonSets in %s", nsText)
-	case viewServices:
-		title = fmt.Sprintf("Services in %s", nsText)
-	case viewNetworkPolicies:
-		title = fmt.Sprintf("Network Policies in %s", nsText)
-	case viewEvents:
-		title = fmt.Sprintf("Events in %s", nsText)
-	case viewNamespaces:
-		title = "Select Namespace"
-	case viewResourceMenu:
-		title = "Select Resource"
 	case viewHelp:
-		title = "Help"
-	case viewDetails:
-		title = "Details"
-	case viewLogs:
-		pod := m.pods[m.cursor]
-		title = fmt.Sprintf("Logs for %s", pod.Name)
+		s.WriteString(renderHelp())
+	case viewResourceMenu:
+		s.WriteString(renderResourceMenu(m))
+	case viewNodes:
+		s.WriteString(renderNodes(m))
+	case viewPods:
+		s.WriteString(renderPods(m))
+	case viewPVCs:
+		s.WriteString(renderPVCs(m))
+	case viewPVs:
+		s.WriteString(renderPVs(m))
+	case viewDeployments:
+		s.WriteString(renderDeployments(m))
+	case viewStatefulSets:
+		s.WriteString(renderStatefulSets(m))
+	case viewDaemonSets:
+		s.WriteString(renderDaemonSets(m))
+	case viewServices:
+		s.WriteString(renderServices(m))
+	case viewNetworkPolicies:
+		s.WriteString(renderNetworkPolicies(m))
+	case viewEvents:
+		s.WriteString(renderEvents(m))
+	case viewNamespaces:
+		s.WriteString(renderNamespaces(m))
+	case viewDeploymentPods:
+		s.WriteString(renderDeploymentPods(m))
+	case viewDetails, viewLogs, viewYAML:
+		s.WriteString(m.viewport.View())
 	case viewScaling:
-		d := m.deployments[m.cursor]
-		title = fmt.Sprintf("Scale Deployment: %s", d.Name)
+		s.WriteString("Scale Deployment:\n")
+		s.WriteString(m.textInput.View())
 	case viewConfirmDelete:
-		p := m.pods[m.cursor]
-		title = fmt.Sprintf("Delete Pod: %s", p.Name)
-	case viewYAML:
-		title = "YAML Details"
-	case viewDashboard: // New case
-		title = "Cluster Dashboard"
-	}
-	return m.styles.HeaderText.Render(title)
-}
-
-func (m model) footerView() string {
-	if m.view == viewHelp {
-		return m.styles.Muted.Render("(esc) back")
-	}
-
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
-
-	if m.view == viewDetails {
-		baseHelp := "(esc) back"
+		var name string
 		switch m.previousView {
 		case viewPods:
-			baseHelp += " | (l)ogs | (d)elete | (y)aml"
+			name = m.pods[m.cursor].Name
 		case viewDeployments:
-			baseHelp += " | (r)eplicas | (y)aml"
-		default:
-			baseHelp += " | (y)aml"
+			name = m.deployments[m.cursor].Name
 		}
-		help = baseHelp
+		s.WriteString(fmt.Sprintf("Are you sure you want to delete %s? (y/n)", name))
+	case viewEditYAML:
+		s.WriteString("Editing YAML (ctrl+s to save, esc to cancel):\n")
+		s.WriteString(m.textarea.View())
+	case viewDashboard:
+		s.WriteString(renderDashboard(m))
+	case viewHostDashboard:
+		s.WriteString(renderHostDashboard(m))
 	}
-	if m.view == viewLogs {
-		help = "(esc) back to details"
-	}
-	if m.view == viewYAML {
-		help = "(esc) back to details"
-	}
-	if m.view == viewScaling {
-		help = "(enter) confirm | (esc) cancel"
-	}
-	if m.view == viewConfirmDelete {
-		help = "(y)es / (n)o"
-	}
-	if m.view == viewResourceMenu {
-		help = "(enter) select | (esc) back"
-	}
-	return m.styles.Muted.Render(help)
+
+	s.WriteString(renderFooter(m))
+	return s.String()
 }
 
-func (m model) View() string {
-	if !m.ready {
-		return "\n  Initializing..."
+func renderHeader(m model) string {
+	ns := m.selectedNamespace
+	if ns == "" {
+		ns = "all"
 	}
-	if m.err != nil {
-		errorMsg := m.styles.Error.Render(fmt.Sprintf("Error: %v", m.err))
-		help := m.styles.Muted.Render("\nIs the Kubernetes Metrics Server installed and running?")
-		return m.styles.Base.Render(lipgloss.JoinVertical(lipgloss.Left, errorMsg, help))
-	}
+	header := fmt.Sprintf("kubeview | Namespace: %s | Press '?' for help", ns)
+	return m.styles.Header.Render(header)
+}
 
-	var finalView string
-	if m.view == viewLogs {
-		finalView = fmt.Sprintf("%s\n%s\n%s", m.headerView(), m.viewport.View(), m.footerView())
-	} else if m.view == viewYAML { // New case for YAML view
-		m.viewport.SetContent(m.yamlContent)
-		finalView = fmt.Sprintf("%s\n%s\n%s", m.headerView(), m.viewport.View(), m.footerView())
-	} else if m.view == viewScaling {
-		var b strings.Builder
-		b.WriteString(m.details)
-		b.WriteString("\n\nScale replicas: " + m.textInput.View())
-		viewContent := b.String()
-		finalView = lipgloss.JoinVertical(lipgloss.Left, m.headerView(), viewContent, m.footerView())
-	} else if m.view == viewConfirmDelete {
-		var b strings.Builder
-		b.WriteString(m.details)
-		b.WriteString(fmt.Sprintf("\n\nAre you sure you want to delete this pod? (y/n)"))
-		viewContent := b.String()
-		finalView = lipgloss.JoinVertical(lipgloss.Left, m.headerView(), viewContent, m.footerView())
-	} else {
-		var viewContent string
-		switch m.view {
-		case viewDetails:
-			viewContent = m.details
-		case viewYAML:
-			m.viewport.SetContent(m.yamlContent)
-			viewContent = m.viewport.View()
+func renderFooter(m model) string {
+	var help string
+	switch m.view {
+	case viewResourceMenu, viewNamespaces:
+		help = " (↑/↓) navigate | (enter) select | (q) quit"
+	case viewNodes, viewPods, viewPVCs, viewPVs, viewDeployments, viewStatefulSets, viewDaemonSets, viewServices, viewNetworkPolicies, viewEvents:
+		help = " (↑/↓) navigate | (enter) details | (esc) back | (q) quit"
+	case viewDeploymentPods:
+		help = " (↑/↓) navigate | (L)ogs | (esc) back"
+	case viewHostDashboard:
+		help = " (l/h) change tab | (↑/↓) navigate | (esc) back | (q) quit"
+	case viewDashboard:
+		help = " (esc) back | (q) quit"
+	case viewDetails:
+		switch m.previousView {
 		case viewPods:
-			viewContent = m.renderPodsList()
-		case viewPVCs:
-			viewContent = m.renderPVCsList()
-		case viewPVs:
-			viewContent = m.renderPVsList()
+			help = " (L)ogs | (X)delete | (Y)AML | (E)dit | (esc) back"
 		case viewDeployments:
-			viewContent = m.renderDeploymentsList()
-		case viewStatefulSets:
-			viewContent = m.renderStatefulSetsList()
-		case viewDaemonSets:
-			viewContent = m.renderDaemonSetsList()
-		case viewServices:
-			viewContent = m.renderServicesList()
-		case viewNetworkPolicies:
-			viewContent = m.renderNetworkPoliciesList()
-		case viewEvents:
-			viewContent = m.renderEventsList()
-		case viewNamespaces:
-			viewContent = m.renderNamespacesList()
-		case viewResourceMenu:
-			viewContent = m.renderResourceMenu()
-		case viewHelp:
-			viewContent = m.renderHelpView()
-		case viewDashboard: // New case
-			viewContent = m.renderDashboard()
-		default: // viewNodes
-			viewContent = m.renderNodesList()
+			help = " (L)ogs | (S)cale | (X)Delete | (Y)AML | (E)dit | (esc) back"
+		default:
+			help = " (Y)AML | (esc) back"
 		}
-		finalView = lipgloss.JoinVertical(lipgloss.Left, m.headerView(), viewContent, m.footerView())
+	case viewLogs, viewYAML, viewScaling, viewConfirmDelete:
+		help = " (esc) back"
+	default:
+		help = " (q)uit"
 	}
 
-	return m.styles.Base.Render(finalView)
+	return m.styles.Footer.Render(help)
+}
+func renderHelp() string {
+	return `
+ kubeview Help:
+
+ (q) or (ctrl+c) - Quit
+ (esc) - Go back to the previous view
+ (H) - Go to Host Dashboard
+ (D) - Go to Cluster Dashboard
+ (↑/k) - Move cursor up
+ (↓/j) - Move cursor down
+ (enter) - Select / View details
+ (y) - View YAML for the selected resource
+ (L) - View logs for the selected pod
+ (S) - Scale the selected deployment
+ (X) - Delete the selected pod
+`
 }
 
-func (m *model) renderHelpView() string {
-	var b strings.Builder
-	b.WriteString(m.styles.HeaderText.Render("Keybindings") + "\n\n")
-	b.WriteString("  Global:\n")
-	b.WriteString("    q, ctrl+c: Quit\n")
-	b.WriteString("    ?: Show this help view\n")
-	b.WriteString("    r: Open resource selection menu\n")
-	b.WriteString("    D: Show cluster dashboard\n")
-	b.WriteString("    N: Select namespace\n\n")
-	b.WriteString("  Navigation:\n")
-	b.WriteString("    up/down: Move cursor\n")
-	b.WriteString("    enter: Select / View details\n")
-	b.WriteString("    esc: Go back\n\n")
-	b.WriteString("  Details View (Pods):\n")
-	b.WriteString("    l: View logs\n")
-	b.WriteString("    d: Delete pod\n")
-	b.WriteString("    y: View YAML\n\n")
-	b.WriteString("  Details View (Deployments):\n")
-	b.WriteString("    r: Scale replicas\n")
-	b.WriteString("    y: View YAML\n\n")
-	b.WriteString("  Other Details Views:\n")
-	b.WriteString("    y: View YAML\n")
-	return b.String()
+func renderResourceMenu(m model) string {
+	s := "Select a resource type:\n\n"
+	for i, rt := range m.resourceTypes {
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + rt)
+		} else {
+			s += "  " + rt
+		}
+		s += "\n"
+	}
+	return s
 }
 
-func (m *model) renderResourceMenu() string {
-	var b strings.Builder
-	b.WriteString(m.styles.HeaderText.Render("Select Resource Type") + "\n")
-
-	for i, resourceType := range m.resourceTypes {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+func renderDeploymentPods(m model) string {
+	s := fmt.Sprintf("Pods for Deployment '%s':\n\n", m.deployments[m.cursor].Name)
+	header := fmt.Sprintf("%-50s %-20s %-15s", "NAME", "STATUS", "RESTARTS")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, pod := range m.deploymentPods {
+		restarts := 0
+		for _, cs := range pod.Status.ContainerStatuses {
+			restarts += int(cs.RestartCount)
 		}
-		b.WriteString(style.Render(resourceType) + "\n")
+		line := fmt.Sprintf("%-50s %-20s %-15d",
+			pod.Name,
+			pod.Status.Phase,
+			restarts,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderNamespacesList() string {
-	var b strings.Builder
-
-	// "All Namespaces" option
-	style := m.styles.Row
-	if m.cursor == 0 {
-		style = m.styles.SelectedRow
-	}
-	b.WriteString(style.Render("[ All Namespaces ]") + "\n")
-
-	for i, ns := range m.namespaces {
-		style := m.styles.Row
-		if m.cursor == i+1 {
-			style = m.styles.SelectedRow
-		}
-		b.WriteString(style.Render(ns.Name) + "\n")
-	}
-	return b.String()
-}
-
-func (m *model) renderEventsList() string {
-	var b strings.Builder
-	if len(m.events) == 0 {
-		return "No Events found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", "LAST SEEN", "TYPE", "REASON", "OBJECT", "MESSAGE"))
-	b.WriteString(header + "\n")
-
-	for i, e := range m.events {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
-		}
-
-		ts := e.LastTimestamp.Time.Format("15:04:05")
-		obj := fmt.Sprintf("%s/%s", e.InvolvedObject.Kind, e.InvolvedObject.Name)
-		msg := strings.Split(e.Message, "\n")[0] // First line only
-
-		typeStyle := m.styles.Success
-		if e.Type == "Warning" {
-			typeStyle = m.styles.Warning
-		}
-
-		line := fmt.Sprintf("%-"+"15s %-"+"10s %-"+"20s %-"+"30s %s", ts, typeStyle.Render(e.Type), e.Reason, obj, msg)
-		b.WriteString(style.Render(line) + "\n")
-	}
-	return b.String()
-}
-
-func (m *model) renderNetworkPoliciesList() string {
-	var b strings.Builder
-	if len(m.netpols) == 0 {
-		return "No Network Policies found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"50s %s", "NAME", "POD SELECTOR"))
-	b.WriteString(header + "\n")
-
-	for i, p := range m.netpols {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
-		}
-		selector, _ := metav1.LabelSelectorAsSelector(&p.Spec.PodSelector)
-		line := fmt.Sprintf("%-"+"50s %s", p.Name, selector.String())
-		b.WriteString(style.Render(line) + "\n")
-	}
-	return b.String()
-}
-
-func (m *model) renderNodesList() string {
-	var b strings.Builder
-	if len(m.nodes) == 0 {
-		return "Fetching nodes..."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %-"+"10s", "NAME", "STATUS", "CPU%", "MEM%"))
-	b.WriteString(header + "\n")
-
+func renderNodes(m model) string {
+	s := "Nodes:\n\n"
+	header := fmt.Sprintf("%-40s %-15s %-15s %-15s %-15s", "NAME", "STATUS", "VERSION", "CPU (m)", "MEM (Mi)")
+	s += m.styles.TableHeader.Render(header) + "\n"
 	for i, node := range m.nodes {
-		status := getNodeStatus(node)
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+		status := "Unknown"
+		for _, cond := range node.Status.Conditions {
+			if cond.Type == v1.NodeReady {
+				status = string(cond.Status)
+				break
+			}
 		}
 
-		statusStyle := m.getStatusStyle(status)
-
-		metrics, hasMetrics := m.nodeMetrics[node.Name]
-		cpuPercent := "---"
-		memPercent := "---"
-		if hasMetrics {
-			cpuPercent = formatPercentage(metrics.Usage.Cpu().MilliValue(), node.Status.Capacity.Cpu().MilliValue()) + "%"
-			memPercent = formatPercentage(metrics.Usage.Memory().Value(), node.Status.Capacity.Memory().Value()) + "%"
+		cpuUsage, memUsage := "N/A", "N/A"
+		if metrics, ok := m.nodeMetrics[node.Name]; ok {
+			cpu := metrics.Usage[v1.ResourceCPU]
+			mem := metrics.Usage[v1.ResourceMemory]
+			cpuUsage = formatMilliCPU(&cpu)
+			memUsage = formatMiBMemory(&mem)
 		}
-		line := fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %-"+"10s", node.Name, statusStyle.Render(status), cpuPercent, memPercent)
-		b.WriteString(style.Render(line) + "\n")
+
+		line := fmt.Sprintf("%-40s %-15s %-15s %-15s %-15s",
+			node.Name,
+			status,
+			node.Status.NodeInfo.KubeletVersion,
+			cpuUsage,
+			memUsage,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderPodsList() string {
-	var b strings.Builder
-	if len(m.pods) == 0 {
-		return "No Pods found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %-"+"10s", "NAME", "STATUS", "CPU%", "MEM%"))
-	b.WriteString(header + "\n")
-
+func renderPods(m model) string {
+	s := "Pods:\n\n"
+	header := fmt.Sprintf("%-50s %-20s %-15s %-15s %-15s", "NAME", "STATUS", "RESTARTS", "CPU (m)", "MEM (Mi)")
+	s += m.styles.TableHeader.Render(header) + "\n"
 	for i, pod := range m.pods {
-		status := string(pod.Status.Phase)
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+		restarts := 0
+		for _, cs := range pod.Status.ContainerStatuses {
+			restarts += int(cs.RestartCount)
 		}
 
-		statusStyle := m.getStatusStyle(status)
-
-		cpuPercent := "---"
-		memPercent := "---"
-		metrics, hasMetrics := m.podMetrics[pod.Name]
-		if hasMetrics {
-			cpuRequests := totalPodCPURequests(pod)
-			memRequests := totalPodMemoryRequests(pod)
-			cpuUsage := totalPodCPU(metrics)
-			memUsage := totalPodMemory(metrics)
-
-			if cpuRequests.MilliValue() > 0 {
-				cpuPercent = formatPercentage(cpuUsage.MilliValue(), cpuRequests.MilliValue()) + "%"
-			}
-			if memRequests.Value() > 0 {
-				memPercent = formatPercentage(memUsage.Value(), memRequests.Value()) + "%"
-			}
+		cpuUsage, memUsage := "N/A", "N/A"
+		if metrics, ok := m.podMetrics[pod.Name]; ok {
+			cpuUsage = formatMilliCPU(totalPodCPU(metrics))
+			memUsage = formatMiBMemory(totalPodMemory(metrics))
 		}
-		line := fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %-"+"10s", pod.Name, statusStyle.Render(status), cpuPercent, memPercent)
-		b.WriteString(style.Render(line) + "\n")
+
+		line := fmt.Sprintf("%-50s %-20s %-15d %-15s %-15s",
+			pod.Name,
+			pod.Status.Phase,
+			restarts,
+			cpuUsage,
+			memUsage,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderPVCsList() string {
-	var b strings.Builder
-	if len(m.pvcs) == 0 {
-		return "No PVCs found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %s", "NAME", "STATUS", "CAPACITY", "VOLUME"))
-	b.WriteString(header + "\n")
-
+func renderPVCs(m model) string {
+	s := "PersistentVolumeClaims:\n\n"
+	header := fmt.Sprintf("%-50s %-20s %-15s %-15s", "NAME", "STATUS", "VOLUME", "CAPACITY")
+	s += m.styles.TableHeader.Render(header) + "\n"
 	for i, pvc := range m.pvcs {
-		status := string(pvc.Status.Phase)
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
-		}
-		statusStyle := m.getStatusStyle(status)
 		capacity := pvc.Status.Capacity[v1.ResourceStorage]
-		line := fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %s", pvc.Name, statusStyle.Render(status), capacity.String(), pvc.Spec.VolumeName)
-		b.WriteString(style.Render(line) + "\n")
-	}
-	return b.String()
-}
+		line := fmt.Sprintf("%-50s %-20s %-15s %-15s",
+			pvc.Name,
+			pvc.Status.Phase,
+			pvc.Spec.VolumeName,
+			capacity.String(),
+		)
 
-func (m *model) renderPVsList() string {
-	var b strings.Builder
-	if len(m.pvs) == 0 {
-		return "No PVs found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %s", "NAME", "STATUS", "CAPACITY", "CLAIM"))
-	b.WriteString(header + "\n")
-
-	for i, pv := range m.pvs {
-		status := string(pv.Status.Phase)
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
 		}
-		statusStyle := m.getStatusStyle(status)
+		s += "\n"
+	}
+	return s
+}
+func renderPVs(m model) string {
+	s := "PersistentVolumes:\n\n"
+	header := fmt.Sprintf("%-50s %-20s %-15s %-15s %-15s", "NAME", "STATUS", "CAPACITY", "CLAIM", "RECLAIM POLICY")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, pv := range m.pvs {
 		capacity := pv.Spec.Capacity[v1.ResourceStorage]
 		claim := ""
 		if pv.Spec.ClaimRef != nil {
 			claim = pv.Spec.ClaimRef.Name
 		}
-		line := fmt.Sprintf("%-"+"40s %-"+"15s %-"+"10s %s", pv.Name, statusStyle.Render(status), capacity.String(), claim)
-		b.WriteString(style.Render(line) + "\n")
+		line := fmt.Sprintf("%-50s %-20s %-15s %-15s %-15s",
+			pv.Name,
+			pv.Status.Phase,
+			capacity.String(),
+			claim,
+			pv.Spec.PersistentVolumeReclaimPolicy,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderDeploymentsList() string {
-	var b strings.Builder
-	if len(m.deployments) == 0 {
-		return "No Deployments found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"10s", "NAME", "REPLICAS"))
-	b.WriteString(header + "\n")
-
+func renderDeployments(m model) string {
+	s := "Deployments:\n\n"
+	header := fmt.Sprintf("%-50s %-15s %-15s %-15s", "NAME", "READY", "UP-TO-DATE", "AVAILABLE")
+	s += m.styles.TableHeader.Render(header) + "\n"
 	for i, d := range m.deployments {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+		line := fmt.Sprintf("%-50s %-15s %-15s %-15s",
+			d.Name,
+			fmt.Sprintf("%d/%d", d.Status.ReadyReplicas, *d.Spec.Replicas),
+			fmt.Sprintf("%d", d.Status.UpdatedReplicas),
+			fmt.Sprintf("%d", d.Status.AvailableReplicas),
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
 		}
-		replicas := fmt.Sprintf("%d/%d", d.Status.ReadyReplicas, d.Status.Replicas)
-		line := fmt.Sprintf("%-"+"40s %-"+"10s", d.Name, replicas)
-		b.WriteString(style.Render(line) + "\n")
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderStatefulSetsList() string {
-	var b strings.Builder
-	if len(m.statefulsets) == 0 {
-		return "No StatefulSets found."
-	}
+func renderStatefulSets(m model) string {
+	s := "StatefulSets:\n\n"
+	header := fmt.Sprintf("%-50s %-15s", "NAME", "READY")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, ss := range m.statefulsets {
+		line := fmt.Sprintf("%-50s %-15s",
+			ss.Name,
+			fmt.Sprintf("%d/%d", ss.Status.ReadyReplicas, *ss.Spec.Replicas),
+		)
 
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"10s", "NAME", "REPLICAS"))
-	b.WriteString(header + "\n")
-
-	for i, s := range m.statefulsets {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
 		}
-		replicas := fmt.Sprintf("%d/%d", s.Status.ReadyReplicas, s.Status.Replicas)
-		line := fmt.Sprintf("%-"+"40s %-"+"10s", s.Name, replicas)
-		b.WriteString(style.Render(line) + "\n")
+		s += "\n"
 	}
-	return b.String()
+	return s
+}
+func renderDaemonSets(m model) string {
+	s := "DaemonSets:\n\n"
+	header := fmt.Sprintf("%-50s %-15s %-15s %-15s", "NAME", "DESIRED", "CURRENT", "READY")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, ds := range m.daemonsets {
+		line := fmt.Sprintf("%-50s %-15d %-15d %-15d",
+			ds.Name,
+			ds.Status.DesiredNumberScheduled,
+			ds.Status.CurrentNumberScheduled,
+			ds.Status.NumberReady,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
+	}
+	return s
 }
 
-func (m *model) renderDaemonSetsList() string {
-	var b strings.Builder
-	if len(m.daemonsets) == 0 {
-		return "No DaemonSets found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"10s", "NAME", "DESIRED/CURRENT"))
-	b.WriteString(header + "\n")
-
-	for i, d := range m.daemonsets {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+func renderServices(m model) string {
+	s := "Services:\n\n"
+	header := fmt.Sprintf("%-50s %-20s %-20s %-20s", "NAME", "TYPE", "CLUSTER-IP", "PORTS")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, svc := range m.services {
+		ports := []string{}
+		for _, p := range svc.Spec.Ports {
+			ports = append(ports, fmt.Sprintf("%d/%s", p.Port, p.Protocol))
 		}
-		replicas := fmt.Sprintf("%d/%d", d.Status.DesiredNumberScheduled, d.Status.CurrentNumberScheduled)
-		line := fmt.Sprintf("%-"+"40s %-"+"10s", d.Name, replicas)
-		b.WriteString(style.Render(line) + "\n")
+		line := fmt.Sprintf("%-50s %-20s %-20s %-20s",
+			svc.Name,
+			svc.Spec.Type,
+			svc.Spec.ClusterIP,
+			strings.Join(ports, ", "),
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
 	}
-	return b.String()
+	return s
+}
+func renderNetworkPolicies(m model) string {
+	s := "NetworkPolicies:\n\n"
+	header := fmt.Sprintf("%-50s", "NAME")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, p := range m.netpols {
+		line := fmt.Sprintf("%-50s", p.Name)
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
+	}
+	return s
+}
+func renderEvents(m model) string {
+	s := "Events:\n\n"
+	header := fmt.Sprintf("%-20s %-20s %-50s %s", "LAST SEEN", "TYPE", "REASON", "MESSAGE")
+	s += m.styles.TableHeader.Render(header) + "\n"
+	for i, e := range m.events {
+		line := fmt.Sprintf("%-20s %-20s %-50s %s",
+			e.LastTimestamp.Format("2006-01-02 15:04:05"),
+			e.Type,
+			e.Reason,
+			e.Message,
+		)
+
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
+		}
+		s += "\n"
+	}
+	return s
 }
 
-func (m *model) renderServicesList() string {
-	var b strings.Builder
-	if len(m.services) == 0 {
-		return "No Services found."
-	}
-
-	header := m.styles.Header.Render(fmt.Sprintf("%-"+"40s %-"+"15s %-"+"15s %s", "NAME", "TYPE", "CLUSTER-IP", "PORTS"))
-	b.WriteString(header + "\n")
-
-	for i, s := range m.services {
-		style := m.styles.Row
-		if m.cursor == i {
-			style = m.styles.SelectedRow
+func renderNamespaces(m model) string {
+	s := "Select a namespace:\n\n"
+	namespaces := append([]v1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: "all"}}}, m.namespaces...)
+	for i, ns := range namespaces {
+		line := ns.Name
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + line)
+		} else {
+			s += "  " + line
 		}
-		var ports []string
-		for _, p := range s.Spec.Ports {
-			ports = append(ports, fmt.Sprintf("%d:%d", p.Port, p.NodePort))
-		}
-		line := fmt.Sprintf("%-"+"40s %-"+"15s %-"+"15s %s", s.Name, s.Spec.Type, s.Spec.ClusterIP, strings.Join(ports, ","))
-		b.WriteString(style.Render(line) + "\n")
+		s += "\n"
 	}
-	return b.String()
+	return s
 }
 
-func (m *model) renderDashboard() string {
-	var b strings.Builder
+func renderDashboard(m model) string {
+	var sb strings.Builder
+	sb.WriteString(m.styles.Title.Render("Cluster Dashboard") + "\n\n")
 
-	b.WriteString(m.styles.HeaderText.Render("Cluster-wide Resource Usage") + "\n")
-	b.WriteString(fmt.Sprintf("  CPU: %s\n", m.clusterCPUUsage))
-	b.WriteString(fmt.Sprintf("  Memory: %s\n", m.clusterMemoryUsage))
-	b.WriteString("\n")
+	// Cluster-wide metrics
+	sb.WriteString(m.styles.Bold.Render("Cluster-wide Usage:") + "\n")
+	sb.WriteString(fmt.Sprintf("CPU: %s\n", m.clusterCPUUsage))
+	sb.WriteString(fmt.Sprintf("Memory: %s\n\n", m.clusterMemoryUsage))
 
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Pods by CPU Usage") + "\n")
-	if len(m.topPodsByCPU) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, p := range m.topPodsByCPU {
-		b.WriteString(fmt.Sprintf("  - %s/%s\n", p.Namespace, p.Name))
-	}
-	b.WriteString("\n")
+	// Chart Section
+	m.podCPUChart.Draw()
+	m.podMemoryChart.Draw()
+	m.nodeCPUChart.Draw()
+	m.nodeMemoryChart.Draw()
 
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Pods by Memory Usage") + "\n")
-	if len(m.topPodsByMemory) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, p := range m.topPodsByMemory {
-		b.WriteString(fmt.Sprintf("  - %s/%s\n", p.Namespace, p.Name))
-	}
-	b.WriteString("\n")
+	podCPUTitle := m.styles.ChartTitle.Render("Top Pods by CPU (mCores)")
+	podMemTitle := m.styles.ChartTitle.Render("Top Pods by Memory (MiB)")
+	nodeCPUTitle := m.styles.ChartTitle.Render("Top Nodes by CPU (mCores)")
+	nodeMemTitle := m.styles.ChartTitle.Render("Top Nodes by Memory (MiB)")
 
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Nodes by CPU Usage") + "\n")
-	if len(m.topNodesByCPU) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, n := range m.topNodesByCPU {
-		b.WriteString(fmt.Sprintf("  - %s\n", n.Name))
-	}
-	b.WriteString("\n")
+	chartsTop := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.JoinVertical(lipgloss.Left, podCPUTitle, m.podCPUChart.View()),
+		lipgloss.JoinVertical(lipgloss.Left, podMemTitle, m.podMemoryChart.View()),
+	)
+	chartsBottom := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.JoinVertical(lipgloss.Left, nodeCPUTitle, m.nodeCPUChart.View()),
+		lipgloss.JoinVertical(lipgloss.Left, nodeMemTitle, m.nodeMemoryChart.View()),
+	)
 
-	b.WriteString(m.styles.HeaderText.Render("Top 5 Nodes by Memory Usage") + "\n")
-	if len(m.topNodesByMemory) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, n := range m.topNodesByMemory {
-		b.WriteString(fmt.Sprintf("  - %s\n", n.Name))
-	}
-	b.WriteString("\n")
+	sb.WriteString(lipgloss.JoinVertical(lipgloss.Left, chartsTop, "\n\n", chartsBottom))
 
-	return b.String()
+	return sb.String()
+}
+func renderHostDashboard(m model) string {
+	var sb strings.Builder
+	sb.WriteString(m.styles.Title.Render("Host-Level Dashboard") + "\n\n")
+
+	// Render Tabs
+	var renderedTabs []string
+	for i, t := range m.hostTabs {
+		if i == m.activeHostTab {
+			renderedTabs = append(renderedTabs, m.styles.ActiveTab.Render(t))
+		} else {
+			renderedTabs = append(renderedTabs, m.styles.Tab.Render(t))
+		}
+	}
+	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...) + "\n\n")
+
+	switch m.hostTabs[m.activeHostTab] {
+	case "Host Metrics":
+		sb.WriteString(renderHostMetrics(m))
+	case "System Logs":
+		left := renderHostLogsMenu(m)
+		right := m.viewport.View()
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
+	case "Application Logs":
+		left := renderAppLogsMenu(m)
+		right := m.viewport.View()
+		sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
+	}
+
+	return sb.String()
+}
+func renderHostMetrics(m model) string {
+	var sb strings.Builder
+	// Charts
+	m.hostCPUChart.Draw()
+	m.hostMemoryChart.Draw()
+
+	cpuTitle := m.styles.ChartTitle.Render("Host CPU Usage (%)")
+	memTitle := m.styles.ChartTitle.Render("Host Memory Usage (%)")
+
+	charts := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.JoinVertical(lipgloss.Left, cpuTitle, m.hostCPUChart.View()),
+		lipgloss.JoinVertical(lipgloss.Left, memTitle, m.hostMemoryChart.View()),
+	)
+	sb.WriteString(charts + "\n\n")
+
+	// Disk Usage
+	sb.WriteString(m.styles.Bold.Render("Disk Usage:") + "\n")
+	diskHeader := fmt.Sprintf("%-20s %-15s %-15s %-15s %s", "Mountpoint", "Total", "Used", "Free", "Used %")
+	sb.WriteString(m.styles.TableHeader.Render(diskHeader) + "\n")
+	for _, d := range m.hostDiskUsage {
+		sb.WriteString(fmt.Sprintf("%-20s %-15s %-15s %-15s %.2f%%\n",
+			d.Mountpoint,
+			formatBytes(d.Total),
+			formatBytes(d.Used),
+			formatBytes(d.Free),
+			d.UsedPercent,
+		))
+	}
+
+	return sb.String()
+}
+func renderHostLogsMenu(m model) string {
+	s := "Select a log type to view:\n\n"
+	for i, lt := range m.hostLogTypes {
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + lt)
+		} else {
+			s += "  " + lt
+		}
+		s += "\n"
+	}
+	return s
+}
+func renderAppLogsMenu(m model) string {
+	s := "Select a container to view logs:\n\n"
+	if len(m.containers) == 0 {
+		return "No running containers found."
+	}
+	for i, c := range m.containers {
+		if i == m.cursor {
+			s += m.styles.SelectedItem.Render("> " + c)
+		} else {
+			s += "  " + c
+		}
+		s += "\n"
+	}
+	return s
 }
 
-func (m *model) formatEventDetails(e v1.Event) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Message:\t%s\n", e.Message))
-	b.WriteString(fmt.Sprintf("Source:\t\t%s, %s\n", e.Source.Component, e.Source.Host))
-	b.WriteString(fmt.Sprintf("Object:\t\t%s/%s\n", e.InvolvedObject.Kind, e.InvolvedObject.Name))
-	b.WriteString(fmt.Sprintf("Count:\t\t%d\n", e.Count))
-	b.WriteString(fmt.Sprintf("First Seen:\t%s\n", e.FirstTimestamp.Time.Format(time.RFC1123)))
-	b.WriteString(fmt.Sprintf("Last Seen:\t%s\n", e.LastTimestamp.Time.Format(time.RFC1123)))
-	return b.String()
+// Formatting functions
+func formatNodeDetails(node v1.Node) string {
+	status := "Unknown"
+	if len(node.Status.Conditions) > 0 {
+		status = string(node.Status.Conditions[len(node.Status.Conditions)-1].Type)
+	}
+	return fmt.Sprintf("Name: %s\nStatus: %s\nKubelet Version: %s\nOS: %s\nArchitecture: %s",
+		node.Name,
+		status,
+		node.Status.NodeInfo.KubeletVersion,
+		node.Status.NodeInfo.OperatingSystem,
+		node.Status.NodeInfo.Architecture,
+	)
 }
 
-func (m *model) formatNodeDetails(node v1.Node, metrics v1beta1.NodeMetrics, hasMetrics bool) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t%s\n", node.Name))
-	b.WriteString(fmt.Sprintf("Status:\t%s\n", m.getStatusStyle(getNodeStatus(node)).Render(getNodeStatus(node))))
-	b.WriteString(fmt.Sprintf("Roles:\t%s\n", getNodeRoles(node)))
-	b.WriteString(fmt.Sprintf("Creation Timestamp:\t%s\n", node.CreationTimestamp.Format(time.RFC1123)))
-
-	if hasMetrics {
-		b.WriteString("\n" + m.styles.HeaderText.Render("Resource Usage") + "\n")
-		b.WriteString(fmt.Sprintf("  CPU:\t%s / %s (%s%%)\n",
-			formatMilliCPU(metrics.Usage.Cpu()),
-			formatMilliCPU(node.Status.Capacity.Cpu()),
-			formatPercentage(metrics.Usage.Cpu().MilliValue(), node.Status.Capacity.Cpu().MilliValue())))
-		b.WriteString(fmt.Sprintf("  Memory:\t%s / %s (%s%%)\n",
-			formatMiBMemory(metrics.Usage.Memory()),
-			formatMiBMemory(node.Status.Capacity.Memory()),
-			formatPercentage(metrics.Usage.Memory().Value(), node.Status.Capacity.Memory().Value())))
+func formatPodDetails(pod v1.Pod) string {
+	restarts := 0
+	for _, cs := range pod.Status.ContainerStatuses {
+		restarts += int(cs.RestartCount)
 	}
 
-	b.WriteString("\n" + m.styles.HeaderText.Render("System Info") + "\n")
-	b.WriteString(fmt.Sprintf("  Architecture:\t%s\n", node.Status.NodeInfo.Architecture))
-	b.WriteString(fmt.Sprintf("  OS:\t%s\n", node.Status.NodeInfo.OperatingSystem))
-	b.WriteString(fmt.Sprintf("  OS Image:\t%s\n", node.Status.NodeInfo.OSImage))
-	b.WriteString(fmt.Sprintf("  Kernel Version:\t%s\n", node.Status.NodeInfo.KernelVersion))
-	b.WriteString(fmt.Sprintf("  Kubelet Version:\t%s\n", node.Status.NodeInfo.KubeletVersion))
-	b.WriteString(fmt.Sprintf("  Container Runtime:\t%s\n", node.Status.NodeInfo.ContainerRuntimeVersion))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Name:\t%s\n", pod.Name))
+	sb.WriteString(fmt.Sprintf("Namespace:\t%s\n", pod.Namespace))
+	sb.WriteString(fmt.Sprintf("Status:\t%s\n", pod.Status.Phase))
+	sb.WriteString(fmt.Sprintf("Node:\t%s\n", pod.Spec.NodeName))
+	sb.WriteString(fmt.Sprintf("IP:\t%s\n", pod.Status.PodIP))
+	sb.WriteString(fmt.Sprintf("Restarts:\t%d\n", restarts))
+	if len(pod.OwnerReferences) > 0 {
+		sb.WriteString(fmt.Sprintf("Controlled By:\t%s\n", pod.OwnerReferences[0].Name))
+	}
 
-	return b.String()
+	// Container Statuses
+	sb.WriteString("\nContainers:\n")
+	for _, cs := range pod.Status.ContainerStatuses {
+		sb.WriteString(fmt.Sprintf("  - Name:\t%s\n", cs.Name))
+		sb.WriteString(fmt.Sprintf("    Image:\t%s\n", cs.Image))
+		sb.WriteString(fmt.Sprintf("    Ready:\t%t\n", cs.Ready))
+		sb.WriteString(fmt.Sprintf("    Restarts:\t%d\n", cs.RestartCount))
+	}
+	return sb.String()
 }
 
-func (m *model) formatPodDetails(pod v1.Pod, metrics v1beta1.PodMetrics, hasMetrics bool) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t%s\n", pod.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", pod.Namespace))
-	b.WriteString(fmt.Sprintf("Status:\t%s\n", m.getStatusStyle(string(pod.Status.Phase)).Render(string(pod.Status.Phase))))
-	b.WriteString(fmt.Sprintf("Pod IP:\t%s\n", pod.Status.PodIP))
-	b.WriteString(fmt.Sprintf("Node:\t%s\n", pod.Spec.NodeName))
-	b.WriteString(fmt.Sprintf("Creation Timestamp:\t%s\n", pod.CreationTimestamp.Format(time.RFC1123)))
-
-	if hasMetrics {
-		b.WriteString("\n" + m.styles.HeaderText.Render("Resource Usage") + "\n")
-		cpuRequests := totalPodCPURequests(pod)
-		memRequests := totalPodMemoryRequests(pod)
-		cpuLimits := totalPodCPULimits(pod)
-		memLimits := totalPodMemoryLimits(pod)
-
-		cpuUsage := totalPodCPU(metrics)
-		memUsage := totalPodMemory(metrics)
-
-		cpuReqPercent := "---"
-		if cpuRequests.MilliValue() > 0 {
-			cpuReqPercent = formatPercentage(cpuUsage.MilliValue(), cpuRequests.MilliValue()) + "%"
-		}
-		memReqPercent := "---"
-		if memRequests.Value() > 0 {
-			memReqPercent = formatPercentage(memUsage.Value(), memRequests.Value()) + "%"
-		}
-
-		cpuLimPercent := "---"
-		if cpuLimits.MilliValue() > 0 {
-			cpuLimPercent = formatPercentage(cpuUsage.MilliValue(), cpuLimits.MilliValue()) + "%"
-		}
-		memLimPercent := "---"
-		if memLimits.Value() > 0 {
-			memLimPercent = formatPercentage(memUsage.Value(), memLimits.Value()) + "%"
-		}
-
-		b.WriteString(fmt.Sprintf("  CPU Usage:\t%s (Requests: %s, Limits: %s)\n",
-			formatMilliCPU(cpuUsage), cpuReqPercent, cpuLimPercent))
-		b.WriteString(fmt.Sprintf("  Memory Usage:\t%s (Requests: %s, Limits: %s)\n",
-			formatMiBMemory(memUsage), memReqPercent, memLimPercent))
-	}
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Containers") + "\n")
-	for _, c := range pod.Spec.Containers {
-		readyStyle := m.styles.Muted
-		if getContainerStatus(pod, c.Name) {
-			readyStyle = m.styles.Success
-		}
-		b.WriteString(fmt.Sprintf("  - Name:\t%s\n", c.Name))
-		b.WriteString(fmt.Sprintf("    Image:\t%s\n", c.Image))
-		b.WriteString(fmt.Sprintf("    Ready:\t%s\n", readyStyle.Render(fmt.Sprintf("%t", getContainerStatus(pod, c.Name)))))
-	}
-
-	return b.String()
-}
-
-func (m *model) formatPVCDetails(pvc v1.PersistentVolumeClaim) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", pvc.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", pvc.Namespace))
-	b.WriteString(fmt.Sprintf("Status:\t\t%s\n", m.getStatusStyle(string(pvc.Status.Phase)).Render(string(pvc.Status.Phase))))
-	b.WriteString(fmt.Sprintf("Volume:\t\t%s\n", pvc.Spec.VolumeName))
-
-	storageClassName := "<none>"
-	if pvc.Spec.StorageClassName != nil {
-		storageClassName = *pvc.Spec.StorageClassName
-	}
-	b.WriteString(fmt.Sprintf("StorageClass:\t%s\n", storageClassName))
-
+func formatPVCDetails(pvc v1.PersistentVolumeClaim) string {
 	capacity := pvc.Status.Capacity[v1.ResourceStorage]
-	b.WriteString(fmt.Sprintf("Capacity:\t%s\n", capacity.String()))
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Access Modes") + "\n")
-	for _, mode := range pvc.Spec.AccessModes {
-		b.WriteString(fmt.Sprintf("  - %s\n", mode))
-	}
-
-	return b.String()
+	return fmt.Sprintf("Name: %s\nNamespace: %s\nStatus: %s\nVolume: %s\nCapacity: %s",
+		pvc.Name,
+		pvc.Namespace,
+		pvc.Status.Phase,
+		pvc.Spec.VolumeName,
+		(&capacity).String(),
+	)
 }
-
-func (m *model) formatPVDetails(pv v1.PersistentVolume) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", pv.Name))
-	b.WriteString(fmt.Sprintf("Status:\t\t%s\n", m.getStatusStyle(string(pv.Status.Phase)).Render(string(pv.Status.Phase))))
-	if pv.Spec.ClaimRef != nil {
-		b.WriteString(fmt.Sprintf("Claim:\t\t%s/%s\n", pv.Spec.ClaimRef.Namespace, pv.Spec.ClaimRef.Name))
-	}
-	b.WriteString(fmt.Sprintf("Reclaim Policy:\t%s\n", pv.Spec.PersistentVolumeReclaimPolicy))
-
-	storageClassName := "<none>"
-	if pv.Spec.StorageClassName != "" {
-		storageClassName = pv.Spec.StorageClassName
-	}
-	b.WriteString(fmt.Sprintf("StorageClass:\t%s\n", storageClassName))
-
+func formatPVDetails(pv v1.PersistentVolume) string {
 	capacity := pv.Spec.Capacity[v1.ResourceStorage]
-	b.WriteString(fmt.Sprintf("Capacity:\t%s\n", capacity.String()))
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Access Modes") + "\n")
-	for _, mode := range pv.Spec.AccessModes {
-		b.WriteString(fmt.Sprintf("  - %s\n", mode))
-	}
-
-	return b.String()
+	return fmt.Sprintf("Name: %s\nStatus: %s\nCapacity: %s\nClaim: %s\nReclaim Policy: %s",
+		pv.Name,
+		pv.Status.Phase,
+		(&capacity).String(),
+		pv.Spec.ClaimRef.Name,
+		pv.Spec.PersistentVolumeReclaimPolicy,
+	)
+}
+func formatDeploymentDetails(d appsv1.Deployment) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Name:\t%s\n", d.Name))
+	sb.WriteString(fmt.Sprintf("Namespace:\t%s\n", d.Namespace))
+	sb.WriteString(fmt.Sprintf("Replicas:\t%d/%d\n", d.Status.ReadyReplicas, *d.Spec.Replicas))
+	sb.WriteString(fmt.Sprintf("Strategy:\t%s\n", d.Spec.Strategy.Type))
+	sb.WriteString(fmt.Sprintf("Last Update:\t%s\n", d.Status.Conditions[0].LastUpdateTime.Format("2006-01-02 15:04:05")))
+	return sb.String()
+}
+func formatStatefulSetDetails(ss appsv1.StatefulSet) string {
+	return fmt.Sprintf("Name: %s\nNamespace: %s\nReplicas: %d/%d",
+		ss.Name,
+		ss.Namespace,
+		ss.Status.ReadyReplicas,
+		*ss.Spec.Replicas,
+	)
+}
+func formatDaemonSetDetails(ds appsv1.DaemonSet) string {
+	return fmt.Sprintf("Name: %s\nNamespace: %s\nDesired: %d\nCurrent: %d\nReady: %d",
+		ds.Name,
+		ds.Namespace,
+		ds.Status.DesiredNumberScheduled,
+		ds.Status.CurrentNumberScheduled,
+		ds.Status.NumberReady,
+	)
 }
 
-func (m *model) formatDeploymentDetails(d appsv1.Deployment) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", d.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", d.Namespace))
-	b.WriteString(fmt.Sprintf("Replicas:\t%d desired | %d updated | %d total | %d available | %d unavailable\n",
-		*d.Spec.Replicas, d.Status.UpdatedReplicas, d.Status.Replicas, d.Status.AvailableReplicas, d.Status.UnavailableReplicas))
-	b.WriteString(fmt.Sprintf("Strategy:\t%s\n", d.Spec.Strategy.Type))
-
-	return b.String()
+func formatServiceDetails(svc v1.Service) string {
+	return fmt.Sprintf("Name: %s\nNamespace: %s\nType: %s\nClusterIP: %s",
+		svc.Name,
+		svc.Namespace,
+		svc.Spec.Type,
+		svc.Spec.ClusterIP,
+	)
 }
-
-func (m *model) formatStatefulSetDetails(s appsv1.StatefulSet) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", s.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", s.Namespace))
-	b.WriteString(fmt.Sprintf("Replicas:\t%d desired | %d ready\n",
-		*s.Spec.Replicas, s.Status.ReadyReplicas))
-	b.WriteString(fmt.Sprintf("Service Name:\t%s\n", s.Spec.ServiceName))
-
-	return b.String()
+func formatNetworkPolicyDetails(p networkingv1.NetworkPolicy) string {
+	return fmt.Sprintf("Name: %s\nNamespace: %s",
+		p.Name,
+		p.Namespace,
+	)
 }
-
-func (m *model) formatDaemonSetDetails(d appsv1.DaemonSet) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", d.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", d.Namespace))
-	b.WriteString(fmt.Sprintf("Pods:\t%d desired | %d current | %d ready\n",
-		d.Status.DesiredNumberScheduled, d.Status.CurrentNumberScheduled, d.Status.NumberReady))
-
-	return b.String()
+func formatEventDetails(e v1.Event) string {
+	return fmt.Sprintf("Reason: %s\nMessage: %s\nSource: %s\nLast Seen: %s",
+		e.Reason,
+		e.Message,
+		e.Source.Component,
+		e.LastTimestamp.Format("2006-01-02 15:04:05"),
+	)
 }
-
-func (m *model) formatServiceDetails(s v1.Service) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", s.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", s.Namespace))
-	b.WriteString(fmt.Sprintf("Type:\t\t%s\n", s.Spec.Type))
-	b.WriteString(fmt.Sprintf("Cluster IP:\t%s\n", s.Spec.ClusterIP))
-	b.WriteString(fmt.Sprintf("External IP:\t%s\n", s.Spec.LoadBalancerIP))
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Ports") + "\n")
-	for _, p := range s.Spec.Ports {
-		b.WriteString(fmt.Sprintf("  - %s:%d -> %d/%s\n", p.Name, p.Port, p.NodePort, p.Protocol))
-	}
-
-	return b.String()
-}
-
-func (m *model) formatNetworkPolicyDetails(p networkingv1.NetworkPolicy) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Name:\t\t%s\n", p.Name))
-	b.WriteString(fmt.Sprintf("Namespace:\t%s\n", p.Namespace))
-
-	selector, _ := metav1.LabelSelectorAsSelector(&p.Spec.PodSelector)
-	b.WriteString(fmt.Sprintf("Pod Selector:\t%s\n", selector.String()))
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Policy Types") + "\n")
-	for _, pt := range p.Spec.PolicyTypes {
-		b.WriteString(fmt.Sprintf("  - %s\n", pt))
-	}
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Ingress Rules") + "\n")
-	if len(p.Spec.Ingress) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, i := range p.Spec.Ingress {
-		b.WriteString("  - Ports:\n")
-		for _, p := range i.Ports {
-			b.WriteString(fmt.Sprintf("    - %s:%s\n", *p.Protocol, p.Port.String()))
-		}
-		b.WriteString("    From:\n")
-		for _, f := range i.From {
-			if f.PodSelector != nil {
-				ps, _ := metav1.LabelSelectorAsSelector(f.PodSelector)
-				b.WriteString(fmt.Sprintf("      - PodSelector: %s\n", ps.String()))
-			}
-			if f.NamespaceSelector != nil {
-				ns, _ := metav1.LabelSelectorAsSelector(f.NamespaceSelector)
-				b.WriteString(fmt.Sprintf("      - NamespaceSelector: %s\n", ns.String()))
-			}
-		}
-	}
-
-	b.WriteString("\n" + m.styles.HeaderText.Render("Egress Rules") + "\n")
-	if len(p.Spec.Egress) == 0 {
-		b.WriteString("  (none)\n")
-	}
-	for _, e := range p.Spec.Egress {
-		b.WriteString("  - Ports:\n")
-		for _, p := range e.Ports {
-			b.WriteString(fmt.Sprintf("    - %s:%s\n", *p.Protocol, p.Port.String()))
-		}
-		b.WriteString("    To:\n")
-		for _, t := range e.To {
-			if t.PodSelector != nil {
-				ps, _ := metav1.LabelSelectorAsSelector(t.PodSelector)
-				b.WriteString(fmt.Sprintf("      - PodSelector: %s\n", ps.String()))
-			}
-			if t.NamespaceSelector != nil {
-				ns, _ := metav1.LabelSelectorAsSelector(t.NamespaceSelector)
-				b.WriteString(fmt.Sprintf("      - NamespaceSelector: %s\n", ns.String()))
-			}
-		}
-	}
-
-	return b.String()
-}
-
-func (m *model) getStatusStyle(status string) lipgloss.Style {
-	switch strings.ToLower(status) {
-	case "running", "bound", "ready", "available", "active":
-		return m.styles.Success
-	case "pending":
-		return m.styles.Warning
-	case "failed", "error", "notready", "terminated", "lost":
-		return m.styles.Error
-	default:
-		return m.styles.Muted
-	}
-}
-
-func getNodeStatus(node v1.Node) string {
-	for _, c := range node.Status.Conditions {
-		if c.Type == v1.NodeReady {
-			if c.Status == v1.ConditionTrue {
-				return "Ready"
-			}
-			return "NotReady"
-		}
-	}
-	return "Unknown"
-}
-
-func getNodeRoles(node v1.Node) string {
-	var roles []string
-	for k := range node.Labels {
-		if strings.HasPrefix(k, "node-role.kubernetes.io/") {
-			roles = append(roles, strings.TrimPrefix(k, "node-role.kubernetes.io/"))
-		}
-	}
-	if len(roles) == 0 {
-		return "<none>"
-	}
-	return strings.Join(roles, ",")
-}
-
-func getContainerStatus(pod v1.Pod, containerName string) bool {
-	for _, s := range pod.Status.ContainerStatuses {
-		if s.Name == containerName {
-			return s.Ready
-		}
-	}
-	return false
-}
-
 func totalPodCPU(metrics v1beta1.PodMetrics) *resource.Quantity {
 	total := resource.NewQuantity(0, resource.DecimalSI)
 	for _, c := range metrics.Containers {
-		total.Add(*c.Usage.Cpu())
+		total.Add(c.Usage[v1.ResourceCPU])
 	}
 	return total
 }
@@ -1742,128 +1950,108 @@ func totalPodCPU(metrics v1beta1.PodMetrics) *resource.Quantity {
 func totalPodMemory(metrics v1beta1.PodMetrics) *resource.Quantity {
 	total := resource.NewQuantity(0, resource.BinarySI)
 	for _, c := range metrics.Containers {
-		total.Add(*c.Usage.Memory())
+		total.Add(c.Usage[v1.ResourceMemory])
 	}
 	return total
 }
 
 func formatMilliCPU(q *resource.Quantity) string {
 	if q == nil {
-		return "---"
+		return "N/A"
 	}
 	return fmt.Sprintf("%dm", q.MilliValue())
 }
 
 func formatMiBMemory(q *resource.Quantity) string {
 	if q == nil {
-		return "---"
+		return "N/A"
 	}
 	return fmt.Sprintf("%dMi", q.Value()/(1024*1024))
 }
-
-func formatPercentage(val, total int64) string {
+func formatPercentage(used, total int64) string {
 	if total == 0 {
 		return "0"
 	}
-	return fmt.Sprintf("%.0f", float64(val)*100/float64(total))
+	return fmt.Sprintf("%.2f", float64(used)/float64(total)*100)
 }
-
-func totalPodCPURequests(pod v1.Pod) *resource.Quantity {
-	total := resource.NewQuantity(0, resource.DecimalSI)
-	for _, c := range pod.Spec.Containers {
-		if c.Resources.Requests != nil {
-			if cpu, ok := c.Resources.Requests[v1.ResourceCPU]; ok {
-				total.Add(cpu)
-			}
-		}
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
 	}
-	return total
-}
-
-func totalPodMemoryRequests(pod v1.Pod) *resource.Quantity {
-	total := resource.NewQuantity(0, resource.BinarySI)
-	for _, c := range pod.Spec.Containers {
-		if c.Resources.Requests != nil {
-			if mem, ok := c.Resources.Requests[v1.ResourceMemory]; ok {
-				total.Add(mem)
-			}
-		}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
 	}
-	return total
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func totalPodCPULimits(pod v1.Pod) *resource.Quantity {
-	total := resource.NewQuantity(0, resource.DecimalSI)
-	for _, c := range pod.Spec.Containers {
-		if c.Resources.Limits != nil {
-			if cpu, ok := c.Resources.Limits[v1.ResourceCPU]; ok {
-				total.Add(cpu)
-			}
-		}
-	}
-	return total
-}
-
-func totalPodMemoryLimits(pod v1.Pod) *resource.Quantity {
-	total := resource.NewQuantity(0, resource.BinarySI)
-	for _, c := range pod.Spec.Containers {
-		if c.Resources.Limits != nil {
-			if mem, ok := c.Resources.Limits[v1.ResourceMemory]; ok {
-				total.Add(mem)
-			}
-		}
-	}
-	return total
-}
-
+// Main function
 func main() {
-	var kubeconfig string
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
+	kubeconfig := flag.String("kubeconfig", filepath.Join(os.Getenv("HOME"), ".kube", "config"), "absolute path to the kubeconfig file")
 	flag.Parse()
 
-	if kubeconfig == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Printf("Error getting user home directory: %v\n", err)
-			os.Exit(1)
-		}
-		kubeconfig = filepath.Join(home, ".kube", "config")
-	}
-
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
-		fmt.Printf("Error building kubeconfig: %v\n", err)
-		os.Exit(1)
+		panic(err.Error())
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		fmt.Printf("Error creating clientset: %v\n", err)
-		os.Exit(1)
+		panic(err.Error())
 	}
 
 	metricsClientset, err := metrics.NewForConfig(config)
 	if err != nil {
-		fmt.Printf("Error creating metrics clientset: %v\n", err)
-		os.Exit(1)
+		panic(err.Error())
 	}
 
-	ti := textinput.New()
-	ti.Placeholder = "3"
-	ti.CharLimit = 3
-	ti.Width = 5
+	m := initialModel(clientset, metricsClientset)
+	p := tea.NewProgram(m, tea.WithAltScreen())
 
-	initialModel := model{
-		clientset:        clientset,
-		metricsClientset: metricsClientset,
-		styles:           defaultStyles(),
-		textInput:        ti,
-		resourceTypes:    []string{"Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PVCs", "PVs", "Network Policies", "Events"},
-	}
-
-	p := tea.NewProgram(initialModel, tea.WithAltScreen())
 	if err := p.Start(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)
 		os.Exit(1)
 	}
+}
+
+func initialModel(clientset *kubernetes.Clientset, metricsClientset *metrics.Clientset) model {
+	styles := DefaultStyles()
+	resourceTypes := []string{"Cluster Dashboard", "Host Dashboard", "Namespaces", "Nodes", "Pods", "Deployments", "StatefulSets", "DaemonSets", "Services", "PersistentVolumeClaims", "PersistentVolumes", "NetworkPolicies", "Events"}
+	hostLogTypes := []string{"System Logs", "Kubelet Logs", "Docker Logs", "dmesg"}
+
+	ta := textarea.New()
+	ta.Placeholder = "Enter YAML..."
+	ta.ShowLineNumbers = true
+	ta.SetWidth(120)
+	ta.SetHeight(25)
+
+	return model{
+		clientset:        clientset,
+		metricsClientset: metricsClientset,
+		resourceTypes:    resourceTypes,
+		hostLogTypes:     hostLogTypes,
+		view:             viewResourceMenu,
+		styles:           styles,
+		textInput:        newTextInput(),
+		textarea:         ta,
+		podCPUChart:      barchart.New(40, 10),
+		podMemoryChart:   barchart.New(40, 10),
+		nodeCPUChart:     barchart.New(40, 10),
+		nodeMemoryChart:  barchart.New(40, 10),
+		hostTabs:         []string{"Host Metrics", "System Logs", "Application Logs"},
+		hostCPUChart:     barchart.New(40, 10),
+		hostMemoryChart:  barchart.New(40, 10),
+	}
+}
+
+func newTextInput() textinput.Model {
+	ti := textinput.New()
+	ti.Placeholder = "1"
+	ti.Focus()
+	ti.CharLimit = 3
+	ti.Width = 20
+	ti.Prompt = "Enter replicas: "
+	return ti
 }
