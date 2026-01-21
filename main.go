@@ -13,10 +13,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimbleMarkets/ntcharts/barchart"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/mem"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -53,6 +57,7 @@ const (
 	viewConfirmDelete
 	viewYAML
 	viewDashboard // New view state for Dashboard
+	viewHost      // New view state for Host Monitoring
 	viewResourceMenu
 	viewHelp
 )
@@ -76,9 +81,10 @@ type model struct {
 	resourceTypes      []string
 	selectedNamespace  string // "" == all
 	details            string
-	yamlContent        string    // New field for YAML content
-	clusterCPUUsage    string    // Aggregated cluster CPU usage
-	clusterMemoryUsage string    // Aggregated cluster Memory usage
+	yamlContent        string // New field for YAML content
+	clusterCPUUsage    string // Aggregated cluster CPU usage
+	clusterMemoryUsage string // Aggregated cluster Memory usage
+	hostChart          barchart.Model
 	topPodsByCPU       []v1.Pod  // Top pods by CPU usage
 	topPodsByMemory    []v1.Pod  // Top pods by Memory usage
 	topNodesByCPU      []v1.Node // Top nodes by CPU usage
@@ -94,6 +100,11 @@ type model struct {
 }
 
 type tickMsg time.Time
+type hostMetricsMsg struct {
+	cpuUsage  float64
+	memUsage  float64
+	diskUsage float64
+}
 type logsMsg struct{ logs string }
 type scaleMsg struct{}
 type podDeletedMsg struct{}
@@ -487,7 +498,30 @@ func getDashboardMetrics(clientset *kubernetes.Clientset, metricsClientset *metr
 		}
 	}
 }
+func getHostMetrics() tea.Cmd {
+	return func() tea.Msg {
+		cpuUsage, err := cpu.Percent(0, false)
+		if err != nil {
+			return errMsg{err}
+		}
 
+		memInfo, err := mem.VirtualMemory()
+		if err != nil {
+			return errMsg{err}
+		}
+
+		diskInfo, err := disk.Usage("/")
+		if err != nil {
+			return errMsg{err}
+		}
+
+		return hostMetricsMsg{
+			cpuUsage:  cpuUsage[0],
+			memUsage:  memInfo.UsedPercent,
+			diskUsage: diskInfo.UsedPercent,
+		}
+	}
+}
 func (m model) Init() tea.Cmd {
 	return tea.Batch(getNodes(m.clientset, m.metricsClientset), doTick())
 }
@@ -536,7 +570,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, getEvents(m.clientset, m.selectedNamespace)
 		case viewDashboard:
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+		case viewHost:
+			return m, getHostMetrics()
 		}
+		return m, doTick()
+	case hostMetricsMsg:
+		m.hostChart.PushAll([]barchart.BarData{
+			{
+				Label: "CPU",
+				Values: []barchart.BarValue{
+					{Value: msg.cpuUsage},
+				},
+			},
+			{
+				Label: "Memory",
+				Values: []barchart.BarValue{
+					{Value: msg.memUsage},
+				},
+			},
+			{
+				Label: "Disk",
+				Values: []barchart.BarValue{
+					{Value: msg.diskUsage},
+				},
+			},
+		})
+		m.hostChart.Draw()
 		return m, doTick()
 	case logsMsg:
 		m.viewport.SetContent(msg.logs)
@@ -836,6 +895,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previousView = m.view
 			m.view = viewDashboard
 			return m, getDashboardMetrics(m.clientset, m.metricsClientset)
+		case "H":
+			m.previousView = m.view
+			m.view = viewHost
+			m.hostChart = barchart.New(75, 20)
+			return m, getHostMetrics()
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
@@ -951,6 +1015,8 @@ func (m model) headerView() string {
 		title = "YAML Details"
 	case viewDashboard: // New case
 		title = "Cluster Dashboard"
+	case viewHost:
+		title = "Host Metrics"
 	}
 	return m.styles.HeaderText.Render(title)
 }
@@ -960,7 +1026,7 @@ func (m model) footerView() string {
 		return m.styles.Muted.Render("(esc) back")
 	}
 
-	help := "(q)uit | (r)esources | (D)ash | (N)s | (?) help"
+	help := "(q)uit | (r)esources | (D)ash | (H)ost | (N)s | (?) help"
 
 	if m.view == viewDetails {
 		baseHelp := "(esc) back"
@@ -1054,6 +1120,8 @@ func (m model) View() string {
 			viewContent = m.renderHelpView()
 		case viewDashboard: // New case
 			viewContent = m.renderDashboard()
+		case viewHost:
+			viewContent = m.renderHostView()
 		default: // viewNodes
 			viewContent = m.renderNodesList()
 		}
@@ -1063,6 +1131,9 @@ func (m model) View() string {
 	return m.styles.Base.Render(finalView)
 }
 
+func (m *model) renderHostView() string {
+	return m.hostChart.View()
+}
 func (m *model) renderHelpView() string {
 	var b strings.Builder
 	b.WriteString(m.styles.HeaderText.Render("Keybindings") + "\n\n")
@@ -1071,6 +1142,7 @@ func (m *model) renderHelpView() string {
 	b.WriteString("    ?: Show this help view\n")
 	b.WriteString("    r: Open resource selection menu\n")
 	b.WriteString("    D: Show cluster dashboard\n")
+	b.WriteString("    H: Show host metrics\n")
 	b.WriteString("    N: Select namespace\n\n")
 	b.WriteString("  Navigation:\n")
 	b.WriteString("    up/down: Move cursor\n")
